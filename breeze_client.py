@@ -151,9 +151,13 @@ async def synthesize(text: str, settings: dict) -> bytes:
         if seed >= 0:
             form.add_field("seed", str(seed))
         if ref_audio:
+            suffix = Path(ref_audio).suffix.lower()
+            if suffix not in {".wav", ".mp3", ".flac", ".ogg", ".opus", ".m4a", ".aac", ".aif", ".aiff"}:
+                raise BreezeError("参考音频的文件扩展名不受支持，请使用 WAV、MP3、FLAC 等常见格式。")
             data = await asyncio.to_thread(_reference_bytes, ref_audio)
-            # Fixed filename avoids leaking local names into service logs.
-            form.add_field("ref_audio", data, filename="reference.wav", content_type="application/octet-stream")
+            # Keep only the safe extension so the server can select a decoder;
+            # never disclose the local filename to the service.
+            form.add_field("ref_audio", data, filename="reference" + suffix, content_type="application/octet-stream")
             form.add_field("ref_text", ref_text)
         kwargs["data"] = form
     try:
