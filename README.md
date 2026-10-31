@@ -16,7 +16,7 @@
 - `[breeze] backend`：`self_hosted`（默认）或 `cloud`。
 - `api_url`：留空自动选择对应后端地址（自托管默认 `http://127.0.0.1:7860`，云端默认 `https://api.breeze.blue`）。[Breeze TTS 官方自托管服务](https://github.com/breezeblue-ai/breeze-tts)须由使用者自行安装、启动并加载模型；麦麦与服务不在同一台机器时需填写麦麦可访问的地址。
 - 云端需设置 `voice_id` 和 `api_key`；也可通过环境变量 `BREEZE_API_KEY` 提供密钥。`model` 留空由服务选择模型；`language_code` 可留空。使用云服务前请自行确认其费用和隐私条款，文本会发送至配置的服务。
-- 自托管可设置 `ref_audio`（麦麦所在机器的参考音频路径）和 `ref_text`（参考音频实际说出的文字）；按服务要求成对提供。请只使用有权使用的声音素材。`cfg_scale` 须大于 0；云端范围 1–10。`seed = -1` 不指定随机种子，使用自托管服务默认值。
+- 自托管可设置 `ref_audio`（麦麦所在机器的参考音频路径）和 `ref_text`（参考音频实际说出的文字）；按服务要求成对提供。支持 `.wav`、`.mp3`、`.flac`、`.ogg`、`.opus`、`.m4a`、`.aac`、`.aif` 和 `.aiff` 扩展名，服务端须支持所用格式。请只使用有权使用的声音素材。`cfg_scale` 须大于 0；云端范围 1–10。`seed = -1` 不指定随机种子，使用自托管服务默认值。
 - `instruction` 为可选的语气和声音指导；`timeout` 为请求超时秒数。
 
 插件将返回的音频作为 WAV 编码为 base64，并通过 MaiBot 的 `voice` 消息发送；它依赖运行中的语音服务和适配器，不能保证所有平台均支持。

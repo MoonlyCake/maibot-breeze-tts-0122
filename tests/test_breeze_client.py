@@ -81,6 +81,19 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(BreezeError):
             await synthesize('text', {'ref_audio': 'missing'})
 
+    async def test_reference_audio_preserves_only_safe_extension(self):
+        with tempfile.TemporaryDirectory() as d:
+            for extension in ('MP3', 'flac', 'ogg'):
+                path = Path(d) / ('personal-reference.' + extension)
+                path.write_bytes(b'reference')
+                await synthesize('text', {'api_url': self.url, 'ref_audio': str(path), 'ref_text': 'exact'})
+                self.assertEqual(self.requests[-1]['ref_audio'], ('reference.' + extension.lower(), b'reference'))
+            bad_path = Path(d) / 'personal-reference.txt'
+            bad_path.write_bytes(b'reference')
+            with self.assertRaises(BreezeError):
+                await synthesize('text', {'api_url': self.url, 'ref_audio': str(bad_path), 'ref_text': 'exact'})
+            self.assertEqual(len(self.requests), 3)
+
     async def test_cloud_format_and_auth(self):
         self.body = wav_bytes()
         with patch.dict(os.environ, {'BREEZE_API_KEY': 'test-key'}):
