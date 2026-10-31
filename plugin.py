@@ -684,7 +684,7 @@ class RandomReplySent(_RandomEvent):
 @register_plugin
 class BreezeTTSPlugin(BasePlugin):
     plugin_name = "breeze_tts_0122"
-    plugin_description = "Breeze TTS 语音合成插件（MaiBot 0.12.2）"
+    plugin_description = "Breeze TTS 语音合成插件（只适配 MaiBot 0.12.2）"
     plugin_version = "1.4.2"
     plugin_author = "MoonlyCake"
     enable_plugin = True
