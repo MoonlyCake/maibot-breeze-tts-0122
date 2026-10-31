@@ -75,7 +75,7 @@ def check_old_config_migration():
         with patch.object(host_plugin_base, "logger", base_log), patch.dict(plugin_globals, {"logger": plugin_log}):
             migrated_plugin = instance.__class__(plugin_dir=str(tmpdir))
         migrated = toml.loads(config_file.read_text(encoding="utf-8"))
-        assert migrated["plugin"]["config_version"] == "1.2.0"
+        assert migrated["plugin"]["config_version"] == "1.4.0"
         assert migrated["general"]["command_enabled"] is False
         assert migrated["general"]["max_text_length"] == 123
         assert migrated["breeze"]["backend"] == "cloud"
@@ -606,5 +606,112 @@ async def main():
     print("PASS: MaiBot 0.12.2 plugin loading, WebUI schema, scope, concurrent limits, command and text fallback")
 
 
+async def check_random_host():
+    from src.plugin_system.base.component_types import EventType, MaiMessages
+    from src.plugin_system.core.events_manager import events_manager
+
+    cfg = config(groups=["qq:123"], cooldown=0, daily=0, admins=["qq:admin"])
+    cfg["breeze"] = {"random_enabled": True, "random_probability": 1.0}
+    cfg["guard"].update(random_daily_limit_enabled=True, random_daily_max_requests=1)
+    instance.config = cfg
+    components = {info.name: cls for info, cls in instance.get_plugin_components()}
+    started = components["breeze_random_started"]()
+    generated = components["breeze_random_generated"]()
+    outgoing = components["breeze_random_send"]()
+    for handler in (started, generated, outgoing):
+        handler.set_plugin_config(cfg)
+        handler.set_plugin_name("breeze_tts_0122")
+    globals_ = outgoing.execute.__globals__
+    targets = {}
+    globals_["message_api"].get_messages_by_time_in_chat = lambda **kw: list(targets.values())
+    globals_["is_bot_self"] = lambda platform, user: False
+    globals_["synthesize"] = AsyncMock(return_value=wav)
+    with tempfile.TemporaryDirectory() as temp:
+        globals_["_GUARD_DB"] = Path(temp) / "guard" / "usage.sqlite3"
+
+        async def attempt(mid, sender="someone", *, quoted=True, content="你好", run_started=True, request="嗨"):
+            targets[mid] = SimpleNamespace(message_id=mid, chat_id="qq-123", processed_plain_text=request,
+                user_info=SimpleNamespace(user_id=sender),
+                chat_info=SimpleNamespace(platform="qq", group_info=SimpleNamespace(group_id="123")))
+            intro = MaiMessages(stream_id="qq-123", llm_prompt="prompt")
+            llm = MaiMessages(stream_id="qq-123", llm_prompt="prompt", llm_response_content=content)
+            segments = [Seg(type="reply", data=mid), Seg(type="text", data=content)] if quoted else [Seg(type="text", data=content)]
+            event = MaiMessages(stream_id="qq-123", is_group_message=True, message_segments=segments,
+                                message_base_info={"platform": "qq", "group_id": "123"})
+            if run_started:
+                await events_manager._dispatch_intercepting_handler_task(started, EventType.POST_LLM, intro)
+            await events_manager._dispatch_intercepting_handler_task(generated, EventType.AFTER_LLM, llm)
+            return await events_manager._dispatch_intercepting_handler_task(outgoing, EventType.POST_SEND, event)
+
+        _, result = await attempt("first")
+        assert result and [s.type for s in result.message_segments] == ["reply", "voice"]
+        _, result = await attempt("second")
+        assert result is None  # per-group random budget exhausted
+        _, result = await attempt("admin", sender="admin")
+        assert result and result.message_segments[-1].type == "voice"  # exemption
+        _, result = await attempt("unquoted", sender="admin", quoted=False)
+        assert result is None  # no verifiable target
+        _, result = await attempt("not-model", run_started=False)
+        assert result is None  # other plugin/command sends are untouched
+        globals_["_GUARD_DB"] = Path(temp) / "failure" / "usage.sqlite3"
+        _, result = await attempt("explicit", request="请用语音回答我")
+        assert result is None  # an explicit voice request is not random
+        _, result = await attempt("command", request="/breeze 你好")
+        assert result is None
+        for index, denied in enumerate(("请只用文字回答", "打字回答", "text only", "type only", "不要语音")):
+            _, result = await attempt(f"denied-{index}", request=denied)
+            assert result is None
+        globals_["synthesize"] = AsyncMock(side_effect=ValueError("mock failure"))
+        _, result = await attempt("failed")
+        assert result is None  # synthesis failure leaves original text intact
+        globals_["synthesize"] = AsyncMock(return_value=wav)
+        _, result = await attempt("after-failure")
+        assert result and result.message_segments[-1].type == "voice"  # failure did not consume random quota
+        globals_["synthesize"].assert_awaited()
+
+        # A cancelled DB await can still commit in its worker thread; cleanup
+        # must release that reservation after it finishes.
+        reserve_started, reserve_continue, released = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        real_reserve, real_finish = globals_["reserve_usage"], globals_["finish_random_usage"]
+        async def delayed_reserve(*args, **kwargs):
+            reserve_started.set()
+            await reserve_continue.wait()
+            return True, "ok"
+        async def checked_finish(*args, **kwargs):
+            assert kwargs["success"] is False
+            released.set()
+            return True, "ok"
+        globals_["reserve_usage"], globals_["finish_random_usage"] = delayed_reserve, checked_finish
+        pending = asyncio.create_task(attempt("cancel-reservation"))
+        await asyncio.wait_for(reserve_started.wait(), 2)
+        pending.cancel()
+        try:
+            await pending
+        except asyncio.CancelledError:
+            pass
+        reserve_continue.set()
+        await asyncio.wait_for(released.wait(), 2)
+        globals_["reserve_usage"], globals_["finish_random_usage"] = real_reserve, real_finish
+
+        globals_["_GUARD_DB"] = Path(temp) / "cancel-synthesis" / "usage.sqlite3"
+        synth_started = asyncio.Event()
+        async def stalled_synthesis(*args, **kwargs):
+            synth_started.set()
+            await asyncio.Event().wait()
+        globals_["synthesize"] = stalled_synthesis
+        pending = asyncio.create_task(attempt("cancel-synthesis"))
+        await asyncio.wait_for(synth_started.wait(), 2)
+        pending.cancel()
+        try:
+            await pending
+        except asyncio.CancelledError:
+            pass
+        globals_["synthesize"] = AsyncMock(return_value=wav)
+        _, result = await attempt("after-cancel")
+        assert result and result.message_segments[-1].type == "voice"
+    print("PASS: 0.12.2 random reply host event, scope, admin and quota")
+
+
 check_old_config_migration()
 asyncio.run(main())
+asyncio.run(check_random_host())

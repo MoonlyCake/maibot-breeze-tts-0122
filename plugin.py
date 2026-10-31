@@ -1,31 +1,47 @@
 """Breeze TTS integration for MaiBot 0.12.2."""
 import base64
 import asyncio
+import hashlib
 from copy import deepcopy
 import math
+import random
 import re
 import time
+import weakref
 from pathlib import Path
 from typing import List, Tuple, Type
 
 from src.common.data_models.database_data_model import DatabaseMessages
 from src.common.logger import get_logger
+from maim_message import Seg
 from src.chat.message_receive.chat_stream import get_chat_manager
 from src.chat.utils.utils import is_bot_self
 from src.plugin_system.apis.plugin_register_api import register_plugin
 from src.plugin_system.base.base_action import BaseAction, ActionActivationType
 from src.plugin_system.base.base_command import BaseCommand
 from src.plugin_system.base.base_plugin import BasePlugin
-from src.plugin_system.base.component_types import ChatMode, ComponentInfo
+from src.plugin_system.base.base_events_handler import BaseEventHandler
+from src.plugin_system.base.component_types import ChatMode, ComponentInfo, EventType
 from src.plugin_system.base.config_types import ConfigField, ConfigLayout, ConfigTab
 from src.plugin_system import PythonDependency
-from src.plugin_system.apis import generator_api
+from src.plugin_system.apis import generator_api, message_api
 
 from .breeze_client import BreezeError, synthesize
-from .voice_guard import claim_request, is_admin, reserve_usage, scope_allowed
+from .voice_guard import claim_request, finish_random_usage, is_admin, reserve_usage, scope_allowed
 
 logger = get_logger("breeze_tts_0122")
 _GUARD_DB = Path(__file__).resolve().parent / "voice_guard_data" / "usage.sqlite3"
+_RANDOM_TASKS = weakref.WeakKeyDictionary()
+
+
+async def _release_cancelled_random(reservation, scope, request_id):
+    """The DB thread may commit after its caller was cancelled."""
+    try:
+        allowed, _ = await reservation
+        if allowed:
+            await finish_random_usage(_GUARD_DB, scope, request_id, success=False)
+    except Exception as exc:
+        logger.warning(f"Breeze random reservation cleanup failed: {type(exc).__name__}")
 
 
 def _mentions_only_bot(segment, platform):
@@ -92,6 +108,15 @@ def _explicit_voice_request(text):
     if any(negation.search(part) for part in parts):
         return False
     return any(positive.search(part) for part in parts)
+
+
+def _voice_denied(text):
+    if not isinstance(text, str):
+        return False
+    denial = r"(?:不要|不用|不必|无需|不需要|不想|不希望|不愿|没必要|别|禁止|关闭|取消|拒绝).{0,8}(?:语音|声音|朗读|读出来|读给我听|说给我听)|(?:语音|声音|朗读).{0,8}(?:不要|不用|别|关闭|取消)|\b(?:don't|dont|do not|never|without|no|not|stop)\b.{0,16}\b(?:voice|aloud|speak|read)\b"
+    text_only = r"(?:只|仅).{0,5}(?:文字|文本|打字)|(?:用|以).{0,3}(?:文字|文本).{0,5}(?:回答|回复)|(?:打字|文字|文本).{0,4}(?:回答|回复)|\b(?:text only|only text|reply in text|type only)\b"
+    return any(re.search(denial, clause) or re.search(text_only, clause)
+               for clause in re.split(r"[，,。.!！?？；;\n]", text.casefold()))
 
 
 def _fresh_voice_message(message, stream_id, platform):
@@ -243,16 +268,19 @@ class VoiceSender:
     @staticmethod
     def _limit_message(reason):
         return {"cooldown": "语音请求过于频繁，请稍后再试", "daily_limit": "今日语音次数已达上限",
+                "random_daily_limit": "本群今日随机语音次数已达上限",
                 "duplicate": "此条语音请求已处理", "invalid_config": "语音限制配置无效",
                 "storage_error": "语音用量检查失败"}.get(reason, "语音用量检查失败")
 
-    async def _reserve(self, scope, request_id):
+    async def _reserve(self, scope, request_id, *, is_random=False):
         try:
             return await reserve_usage(
                 _GUARD_DB, f"{scope[0]}:{scope[1]}",
                 self.get_config("guard.cooldown_seconds", 60),
                 self.get_config("guard.daily_max_requests", 0),
                 request_id=request_id, bypass_limits=self._is_admin(scope[0]),
+                random_daily_max_requests=(self.get_config("guard.random_daily_max_requests", 5)
+                    if self.get_config("guard.random_daily_limit_enabled", False) else 0) if is_random else None,
             )
         except Exception as exc:
             logger.warning(f"Breeze TTS usage guard failed: {type(exc).__name__}")
@@ -410,11 +438,151 @@ class BreezeCommand(VoiceSender, BaseCommand):
         return True, "已发送语音" if ok else (("已发送文字回复；" if ok is False else "") + message), 2
 
 
+class _RandomEvent(BaseEventHandler):
+    intercept_message = True
+
+    @staticmethod
+    def _task():
+        return asyncio.current_task()
+
+
+class RandomReplyStarted(_RandomEvent):
+    event_type = EventType.POST_LLM
+    handler_name = "breeze_random_started"
+    handler_description = "记录普通回复生成"
+
+    async def execute(self, message):
+        task = self._task()
+        if task is not None:
+            _RANDOM_TASKS.pop(task, None)
+            prompt = getattr(message, "llm_prompt", None)
+            if message and message.stream_id and isinstance(prompt, str) and prompt:
+                _RANDOM_TASKS[task] = (message.stream_id, time.monotonic(), None,
+                                       hashlib.sha256(prompt.encode()).digest())
+        return True, True, None, None, None
+
+
+class RandomReplyGenerated(_RandomEvent):
+    event_type = EventType.AFTER_LLM
+    handler_name = "breeze_random_generated"
+    handler_description = "校验普通回复生成结果"
+
+    async def execute(self, message):
+        task = self._task()
+        mark = _RANDOM_TASKS.get(task)
+        text = getattr(message, "llm_response_content", None)
+        prompt = getattr(message, "llm_prompt", None)
+        if (task is not None and mark and message and message.stream_id == mark[0]
+                and time.monotonic() - mark[1] < 120 and isinstance(text, str) and text.strip()
+                and isinstance(prompt, str) and hashlib.sha256(prompt.encode()).digest() == mark[3]):
+            _RANDOM_TASKS[task] = (mark[0], mark[1], text.strip(), mark[3])
+        elif task is not None:
+            _RANDOM_TASKS.pop(task, None)
+        return True, True, None, None, None
+
+
+class RandomReplySend(_RandomEvent):
+    event_type = EventType.POST_SEND
+    handler_name = "breeze_random_send"
+    handler_description = "将已确认的普通群聊回复按概率转为语音"
+
+    async def execute(self, message):
+        task = self._task()
+        mark = _RANDOM_TASKS.pop(task, None) if task is not None else None
+        unchanged = (True, True, None, None, None)
+        if (not self.get_config("breeze.random_enabled", False) or not mark or not message
+                or message.stream_id != mark[0] or time.monotonic() - mark[1] >= 120
+                or not isinstance(mark[2], str) or not message.is_group_message):
+            return unchanged
+        probability = self.get_config("breeze.random_probability", 0.1)
+        if (isinstance(probability, bool) or not isinstance(probability, (float, int))
+                or not math.isfinite(probability) or not 0 <= probability <= 1
+                or random.random() >= probability):
+            return unchanged
+        info = message.message_base_info
+        platform = str(info.get("platform") or "").strip() if isinstance(info, dict) else ""
+        group = str(info.get("group_id") or "").strip() if isinstance(info, dict) else ""
+        if not platform or not group or not scope_allowed(True, group, self.get_config("guard.allowed_groups", []), False, platform=platform):
+            return unchanged
+        segments = message.message_segments
+        if not isinstance(segments, list) or len(segments) != 2:
+            return unchanged
+        replies = [s for s in segments if getattr(s, "type", None) == "reply"]
+        texts = [s for s in segments if getattr(s, "type", None) == "text"]
+        if len(replies) != 1 or len(texts) != 1:
+            return unchanged
+        target_id = getattr(replies[0], "data", None)
+        text = getattr(texts[0], "data", None)
+        if (not isinstance(target_id, str) or not target_id.strip() or not isinstance(text, str)
+                or not text.strip() or text.strip() != mark[2]):
+            return unchanged
+        max_length = self.get_config("general.max_text_length", 500)
+        if not isinstance(max_length, int) or isinstance(max_length, bool) or not 1 <= len(text.strip()) <= min(max_length, 5000):
+            return unchanged
+        try:
+            now = time.time()
+            targets = await asyncio.wait_for(asyncio.to_thread(message_api.get_messages_by_time_in_chat,
+                chat_id=message.stream_id, start_time=now - 300, end_time=now,
+                limit=100, limit_mode="latest", filter_mai=True), timeout=4)
+            targets = [m for m in targets if str(getattr(m, "message_id", "")) == target_id]
+            if len(targets) != 1:
+                return unchanged
+            target = targets[0]
+            user = getattr(target, "user_info", None)
+            chat = getattr(target, "chat_info", None)
+            sender = str(getattr(user, "user_id", "") or "").strip()
+            user_platform = str(getattr(user, "platform", "") or "").strip()
+            target_group = getattr(chat, "group_info", None)
+            if (not sender or is_bot_self(platform, sender) or str(getattr(target, "chat_id", "")) != message.stream_id
+                    or (user_platform and user_platform.lower() != platform.lower())
+                    or str(getattr(chat, "platform", "") or "").lower() != platform.lower()
+                    or str(getattr(target_group, "group_id", "") or "") != group):
+                return unchanged
+            request = str(getattr(target, "processed_plain_text", "") or "")
+            if _explicit_voice_request(request) or re.search(r"(?:^|\s)/breeze(?:\s|$)", request, re.I):
+                return unchanged
+            if _voice_denied(request):
+                return unchanged
+            scope = f"{platform}:{message.stream_id}"
+            request_id = "random:" + target_id
+            random_limit = (self.get_config("guard.random_daily_max_requests", 5)
+                            if self.get_config("guard.random_daily_limit_enabled", False) else 0)
+            reservation = asyncio.create_task(reserve_usage(_GUARD_DB, scope, self.get_config("guard.cooldown_seconds", 60),
+                self.get_config("guard.daily_max_requests", 0), request_id=request_id,
+                bypass_limits=is_admin(platform, sender, self.get_config("guard.admin_users", [])),
+                random_daily_max_requests=random_limit))
+            try:
+                allowed, _ = await asyncio.shield(reservation)
+            except asyncio.CancelledError:
+                asyncio.create_task(_release_cancelled_random(reservation, scope, request_id))
+                raise
+            if not allowed:
+                return unchanged
+            success = False
+            try:
+                settings = VoiceSender._settings(self)
+                audio = await synthesize(text.strip(), settings)
+                if (not isinstance(audio, bytes) or len(audio) < 44 or len(audio) > 10 * 1024 * 1024
+                        or audio[:4] != b"RIFF" or audio[8:12] != b"WAVE"):
+                    return unchanged
+                updated = message.deepcopy()
+                updated.modify_message_segments([replies[0], Seg(type="voice", data=base64.b64encode(audio).decode("ascii"))], suppress_warning=True)
+                success = True
+                return True, True, None, None, updated
+            finally:
+                await asyncio.shield(finish_random_usage(_GUARD_DB, scope, request_id, success=success))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(f"Breeze random voice failed: {type(exc).__name__}")
+            return unchanged
+
+
 @register_plugin
 class BreezeTTSPlugin(BasePlugin):
     plugin_name = "breeze_tts_0122"
     plugin_description = "Breeze TTS 语音合成插件（MaiBot 0.12.2）"
-    plugin_version = "1.3.0"
+    plugin_version = "1.4.0"
     plugin_author = "MoonlyCake"
     enable_plugin = True
     config_file_name = "config.toml"
@@ -429,7 +597,7 @@ class BreezeTTSPlugin(BasePlugin):
     config_schema = {
         "plugin": {
             "enabled": ConfigField(type=bool, default=True, description="启用插件", label="启用 Breeze TTS", order=1),
-            "config_version": ConfigField(type=str, default="1.2.0", description="配置版本", hidden=True),
+            "config_version": ConfigField(type=str, default="1.4.0", description="配置版本", hidden=True),
         },
         "general": {
             "action_enabled": ConfigField(type=bool, default=True, description="启用语音 Action", label="允许语音 Action", hint="需同时启用范围与用量中的自然语言语音。此项变动后重载插件。", order=1),
@@ -450,6 +618,8 @@ class BreezeTTSPlugin(BasePlugin):
             "cfg_scale": ConfigField(type=float, default=1.0, description="语音控制强度", label="声音指导强度", input_type="number", min=0.01, step=0.1, hint="自托管需大于 0；云端允许 1–10。", order=10),
             "seed": ConfigField(type=int, default=-1, description="自托管随机种子，-1 表示省略并使用服务端默认值", label="自托管随机种子", input_type="number", min=-1, max=4294967295, step=1, hint="-1 表示不传入种子，使用服务端默认值。", order=11),
             "timeout": ConfigField(type=int, default=120, description="单次请求超时秒数", label="请求超时（秒）", input_type="number", min=1, step=1, hint="模型加载或生成较慢时可适当调大。", order=12),
+            "random_enabled": ConfigField(type=bool, default=False, description="随机语音回复", label="随机语音回复", hint="默认关闭；开启后重载插件。仅有可靠来源及引用目标的群聊普通回复可转换。", order=13),
+            "random_probability": ConfigField(type=float, default=0.1, description="随机语音概率", label="随机语音概率", input_type="number", min=0.0, max=1.0, step=0.05, hint="0 不触发；1 表示每条符合条件的回复都尝试。", order=14),
         },
         "guard": {
             "natural_enabled": ConfigField(type=bool, default=False, description="自然语言语音回复", label="自然语言语音回复", hint="默认关闭；仅当用户明确要求语音且聊天已授权时，允许模型选择语音 Action。修改后重载插件。", order=1),
@@ -457,6 +627,8 @@ class BreezeTTSPlugin(BasePlugin):
             "allow_private": ConfigField(type=bool, default=False, description="允许私聊语音", label="允许私聊", hint="默认关闭；开启后私聊也受用量与冷却限制。", order=3),
             "admin_users": ConfigField(type=list, default=[], description="管理员账号列表", label="管理员账号", item_type="string", hint="仅豁免冷却和每日语音上限；仍受聊天范围、重复请求和平台余额限制。QQ 可填纯号码，其他平台填 平台:用户ID。", order=4),
             "cooldown_seconds": ConfigField(type=int, default=60, description="同一会话冷却时间（秒）", label="每会话冷却（秒）", input_type="number", min=0, max=86400, step=1, hint="默认 60 秒；0 表示关闭冷却。", order=5),
+            "random_daily_limit_enabled": ConfigField(type=bool, default=False, description="启用随机语音每日群限额", label="随机语音每日限额", hint="默认关闭。开启后每个群独立计数；主动要求语音不占此额度。", order=7),
+            "random_daily_max_requests": ConfigField(type=int, default=5, description="每群每天随机语音次数", label="每群每天随机语音次数", input_type="number", min=0, max=10000, step=1, hint="开启每日限额后生效；0 表示不限。", order=8),
             "daily_max_requests": ConfigField(type=int, default=0, description="每天最多合成次数", label="每日合成次数", input_type="number", min=0, max=10000, step=1, hint="所有聊天和两种触发方式共享；按运行机器本地日期，0 表示不限。发起前计数，失败不退。", order=6),
         },
     }
@@ -481,4 +653,7 @@ class BreezeTTSPlugin(BasePlugin):
             result.append((BreezeAction.get_action_info(), BreezeAction))
         if self.get_config("general.command_enabled", True):
             result.append((BreezeCommand.get_command_info(), BreezeCommand))
+        if self.get_config("breeze.random_enabled", False):
+            for handler in (RandomReplyStarted, RandomReplyGenerated, RandomReplySend):
+                result.append((handler.get_handler_info(), handler))
         return result
