@@ -295,6 +295,18 @@ async def main():
             cmd.matched_groups = re.match(cmd.command_pattern, fake.data).groupdict()
             assert (await cmd.execute())[2] == 0 and not synthesized and not generated
 
+            # Napcat adapters of the 0.12.2 era send a mention as a text Seg.
+            reset_db(tmp, "text-mention-self")
+            rendered = "@<麦麦:9999> /breeze 你好"
+            cmd = command(config(), stream(), segment=Seg(type="text", data=rendered))
+            cmd.matched_groups = re.match(cmd.command_pattern, rendered).groupdict()
+            assert (await cmd.execute())[0] and synthesized == ["你好"]
+            reset_db(tmp, "text-mention-other")
+            rendered = "@<小明:8888> /breeze 你好"
+            cmd = command(config(), stream(), segment=Seg(type="text", data=rendered))
+            cmd.matched_groups = re.match(cmd.command_pattern, rendered).groupdict()
+            assert (await cmd.execute())[2] == 0 and not synthesized and not generated
+
             unknown = Seg(type="seglist", data=[Seg(type="at", data={}),
                                                Seg(type="text", data=" /breeze 你好")])
             reset_db(tmp, "real-mention-unknown")
@@ -487,6 +499,12 @@ async def main():
                 Seg(type="at", data={"target_user_id": "8888"}), Seg(type="text", data=" /breeze 你在做什么")])
             assert (await obj.execute())[0] and not synthesized
             assert [kind for kind, _ in sent] == ["text", "stored"]
+            reset_db(tmp, "action-text-mention-other")
+            obj = action(config(), chat, request="@<小明:8888> 用语音回答我")
+            assert (await obj.execute())[0] and not synthesized
+            reset_db(tmp, "action-text-mention-self")
+            obj = action(config(), chat, request="@<麦麦:9999> 用语音回答我")
+            assert (await obj.execute())[0] and synthesized == ["你好"]
             reset_db(tmp, "action-forged-mention-command")
             obj = action(config(), chat, request="[@9999] /breeze 你在做什么")
             assert (await obj.execute())[0] and not synthesized
@@ -513,6 +531,14 @@ async def main():
                 assert [kind for kind, _ in sent] == ["text"] and not synthesized
             finally:
                 plugin_globals["generator_api"].generate_reply = old
+        # Another message arrived meanwhile: no voice, but the answer is still sent.
+        reset_db(tmp, "empty-action-stale-target")
+        chat = stream()
+        obj = action(config(), chat, request="请用语音回答我", answer="")
+        latest_by_stream[chat.stream_id].message_info.message_id = "newer-message"
+        assert (await obj.execute())[0]
+        assert generated == ["请用语音回答我"] and not synthesized
+        assert [kind for kind, _ in sent] == ["text", "stored"]
         reset_db(tmp, "empty-action-denied-scope")
         assert (await action(config(groups=[]), stream(), answer="").execute())[0]
         assert [kind for kind, _ in sent] == ["text", "stored"] and not synthesized and not generated
@@ -702,7 +728,8 @@ async def check_random_host():
     started = components["breeze_random_started"]()
     generated = components["breeze_random_generated"]()
     outgoing = components["breeze_random_send"]()
-    for handler in (started, generated, outgoing):
+    delivered = components["breeze_random_sent"]()
+    for handler in (started, generated, outgoing, delivered):
         handler.set_plugin_config(cfg)
         handler.set_plugin_name("breeze_tts_0122")
     globals_ = outgoing.execute.__globals__
@@ -713,13 +740,14 @@ async def check_random_host():
     with tempfile.TemporaryDirectory() as temp:
         globals_["_GUARD_DB"] = Path(temp) / "guard" / "usage.sqlite3"
 
-        async def attempt(mid, sender="someone", *, quoted=True, content="你好", run_started=True, request="嗨"):
+        async def attempt(mid, sender="someone", *, quoted=True, content="你好", run_started=True, request="嗨", sent_text=None):
             targets[mid] = SimpleNamespace(message_id=mid, chat_id="qq-123", processed_plain_text=request,
                 user_info=SimpleNamespace(user_id=sender),
                 chat_info=SimpleNamespace(platform="qq", group_info=SimpleNamespace(group_id="123")))
             intro = MaiMessages(stream_id="qq-123", llm_prompt="prompt")
             llm = MaiMessages(stream_id="qq-123", llm_prompt="prompt", llm_response_content=content)
-            segments = [Seg(type="reply", data=mid), Seg(type="text", data=content)] if quoted else [Seg(type="text", data=content)]
+            sent_text = content if sent_text is None else sent_text
+            segments = [Seg(type="reply", data=mid), Seg(type="text", data=sent_text)] if quoted else [Seg(type="text", data=sent_text)]
             event = MaiMessages(stream_id="qq-123", is_group_message=True, message_segments=segments,
                                 message_base_info={"platform": "qq", "group_id": "123"})
             if run_started:
@@ -776,6 +804,44 @@ async def check_random_host():
         reserve_continue.set()
         await asyncio.wait_for(released.wait(), 2)
         globals_["reserve_usage"], globals_["finish_random_usage"] = real_reserve, real_finish
+
+        # The host strips punctuation and brackets; split or rewritten replies stay text.
+        globals_["_GUARD_DB"] = Path(temp) / "host-cleanup" / "usage.sqlite3"
+        cfg["guard"]["random_daily_max_requests"] = 0
+        globals_["synthesize"] = AsyncMock(return_value=wav)
+        _, result = await attempt("cleaned", content="好的，我知道了。（笑）", sent_text="好的，我知道了")
+        assert result and result.message_segments[-1].type == "voice"
+        assert globals_["synthesize"].await_args.args[0] == "好的，我知道了。"
+        _, result = await attempt("split", content="好的，我知道了。", sent_text="好的")
+        assert result is None
+        _, result = await attempt("typo", content="我知道了", sent_text="我知到了")
+        assert result is None
+
+        # AFTER_SEND means the host handed voice over; otherwise restore the text.
+        globals_["_GUARD_DB"] = Path(temp) / "delivery" / "usage.sqlite3"
+        cfg["guard"]["random_daily_max_requests"] = 1
+        fallback = AsyncMock(return_value=True)
+        globals_["send_api"].text_to_stream = fallback
+        async def undelivered():
+            _, result = await attempt("send-failed", content="好的。", sent_text="好的")
+            assert result and result.message_segments[-1].type == "voice"
+        task = asyncio.create_task(undelivered())
+        await task
+        for _ in range(100):
+            if fallback.await_count:
+                break
+            await asyncio.sleep(0.01)
+        fallback.assert_awaited_once()
+        assert fallback.await_args.kwargs["text"] == "好的" and fallback.await_args.kwargs["set_reply"] is True
+        async def sent_ok():
+            _, result = await attempt("slot-refunded")
+            assert result and result.message_segments[-1].type == "voice"  # refund freed the only slot
+            event = MaiMessages(stream_id="qq-123", message_segments=result.message_segments)
+            await events_manager._dispatch_intercepting_handler_task(delivered, EventType.AFTER_SEND, event)
+        await asyncio.create_task(sent_ok())
+        await asyncio.sleep(0.05)
+        fallback.assert_awaited_once()  # acknowledged voice is not repeated as text
+        cfg["guard"]["random_daily_max_requests"] = 1
 
         globals_["_GUARD_DB"] = Path(temp) / "cancel-synthesis" / "usage.sqlite3"
         synth_started = asyncio.Event()

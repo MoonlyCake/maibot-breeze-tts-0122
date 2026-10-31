@@ -24,15 +24,52 @@ from src.plugin_system.base.base_events_handler import BaseEventHandler
 from src.plugin_system.base.component_types import ChatMode, ComponentInfo, EventType
 from src.plugin_system.base.config_types import ConfigField, ConfigLayout, ConfigTab
 from src.plugin_system import PythonDependency
-from src.plugin_system.apis import generator_api, message_api
+from src.plugin_system.apis import generator_api, message_api, send_api
 
 from .breeze_client import BreezeError, synthesize
-from .voice_guard import claim_request, finish_random_usage, is_admin, reserve_usage, scope_allowed
+from .voice_guard import claim_request, finish_random_usage, is_admin, refund_random_usage, reserve_usage, scope_allowed
 
 logger = get_logger("breeze_tts_0122")
 _GUARD_DB = Path(__file__).resolve().parent / "voice_guard_data" / "usage.sqlite3"
 _RANDOM_TASKS = weakref.WeakKeyDictionary()
-_RAW_COMMAND_PATTERN = r"^\s*/breeze(?:\s+(?P<text>[\s\S]+?))?\s*$"
+_RANDOM_PENDING = weakref.WeakKeyDictionary()
+_RANDOM_WATCHERS = set()
+_RANDOM_WATCH_SECONDS = 300
+_RAW_COMMAND_PATTERN = r"^\s*(?:@<[^<>\n]{1,128}>\s*)*/breeze(?:\s+(?P<text>[\s\S]+?))?\s*$"
+# The same bracket removal as the 0.12.2 process_llm_response.
+_HOST_REMOVED_BRACKETS = re.compile(r"[(\[（](?=.*[一-鿿]).*?[)\]）]")
+
+
+def _cleaned_reply(text):
+    return _HOST_REMOVED_BRACKETS.sub("", text).strip()
+
+
+def _same_reply(sent, generated):
+    """Allow the host's punctuation and bracket cleanup, not splits or rewrites."""
+    words = lambda value: "".join(char for char in value if char.isalnum())
+    sent_words = words(sent)
+    return bool(sent_words) and sent_words == words(_cleaned_reply(generated))
+
+
+async def _resend_undelivered_random(task, pending):
+    """The host has no failure event; a finished task without AFTER_SEND did not deliver."""
+    await asyncio.wait({task}, timeout=_RANDOM_WATCH_SECONDS)
+    if pending["delivered"] or not task.done() or task.cancelled():
+        return
+    try:
+        await refund_random_usage(_GUARD_DB, pending["scope"], pending["request_id"])
+        await send_api.text_to_stream(text=pending["text"], stream_id=pending["stream_id"],
+                                      reply_message=pending["target"], set_reply=True)
+    except Exception as exc:
+        logger.warning(f"Breeze random text fallback failed: {type(exc).__name__}")
+
+
+def _watch_random_delivery(task, **pending):
+    pending["delivered"] = False
+    _RANDOM_PENDING[task] = pending
+    watcher = asyncio.create_task(_resend_undelivered_random(task, pending))
+    _RANDOM_WATCHERS.add(watcher)
+    watcher.add_done_callback(_RANDOM_WATCHERS.discard)
 
 
 async def _release_cancelled_random(reservation, scope, request_id):
@@ -45,6 +82,15 @@ async def _release_cancelled_random(reservation, scope, request_id):
         logger.warning(f"Breeze random reservation cleanup failed: {type(exc).__name__}")
 
 
+def _is_bot_target(target, platform):
+    if not isinstance(target, (str, int)) or isinstance(target, bool) or not str(target).strip():
+        return False
+    try:
+        return bool(is_bot_self(platform, str(target).strip()))
+    except Exception:
+        return False
+
+
 def _mentions_only_bot(segment, platform):
     """Reject untrusted or other-user mentions that the 0.12.2 parser strips."""
     if segment is None:
@@ -55,6 +101,10 @@ def _mentions_only_bot(segment, platform):
         return isinstance(data, list) and all(_mentions_only_bot(part, platform) for part in data)
     if kind == "mention_bot":
         return True
+    if kind == "text" and isinstance(data, str):
+        # Napcat adapters of the 0.12.2 era send mentions as text: @<nickname:id>.
+        return all(_is_bot_target(token.rpartition(":")[2], platform)
+                   for token in re.findall(r"@<([^<>\n]*)>", data))
     if kind != "at":
         return bool(isinstance(kind, str) and kind and not kind.startswith(("at", "mention")))
     if isinstance(data, dict):
@@ -64,12 +114,7 @@ def _mentions_only_bot(segment, platform):
         target = data.get("target_user_id") or data.get("user_id") or data.get("qq")
     else:
         target = data
-    if not isinstance(target, (str, int)) or isinstance(target, bool) or not str(target).strip():
-        return False
-    try:
-        return bool(is_bot_self(platform, str(target).strip()))
-    except Exception:
-        return False
+    return _is_bot_target(target, platform)
 
 
 def _raw_command_text(segment):
@@ -349,6 +394,13 @@ class BreezeAction(VoiceSender, BaseAction):
                 logger.warning(f"Breeze TTS message guard failed: {type(exc).__name__}")
         if not claim_ok or scope is None or not scope[2] or not fresh_voice:
             logger.info("Breeze Action skipped speech: request or scope not verified")
+            # An authorized chat still deserves the answer, only without voice.
+            if not text and scope is not None and scope[2]:
+                try:
+                    text = await self._generate_context_reply(target)
+                except Exception as exc:
+                    logger.warning(f"Breeze TTS reply generation failed: {type(exc).__name__}")
+                    text = None
             if not await self.send_text(text or "抱歉，暂时无法生成回复，请稍后再试。"):
                 return False, "文字回复发送失败"
             await self.store_action_info(action_build_into_prompt=True,
@@ -387,7 +439,7 @@ class BreezeAction(VoiceSender, BaseAction):
 class BreezeCommand(VoiceSender, BaseCommand):
     command_name = "breeze_tts_command"
     command_description = "让麦麦回答问题并尝试发送语音"
-    command_pattern = r"^\s*(?:\[@[^\]\n]{1,128}\]\s*)?/breeze(?:\s+(?P<text>[\s\S]+?))?\s*$"
+    command_pattern = r"^\s*(?:(?:\[@[^\]\n]{1,128}\]|@<[^<>\n]{1,128}>)\s*)*/breeze(?:\s+(?P<text>[\s\S]+?))?\s*$"
     command_help = "/breeze <问题>：让麦麦回答并发送语音"
     command_examples = ["/breeze 你在做什么？"]
 
@@ -546,10 +598,12 @@ class RandomReplySend(_RandomEvent):
         target_id = getattr(replies[0], "data", None)
         text = getattr(texts[0], "data", None)
         if (not isinstance(target_id, str) or not target_id.strip() or not isinstance(text, str)
-                or not text.strip() or text.strip() != mark[2]):
+                or not text.strip() or not _same_reply(text, mark[2])):
             return unchanged
+        # Speak the generated wording: the host may have removed its punctuation.
+        spoken = _cleaned_reply(mark[2])
         max_length = self.get_config("general.max_text_length", 500)
-        if not isinstance(max_length, int) or isinstance(max_length, bool) or not 1 <= len(text.strip()) <= min(max_length, 5000):
+        if not isinstance(max_length, int) or isinstance(max_length, bool) or not 1 <= len(spoken) <= min(max_length, 5000):
             return unchanged
         try:
             now = time.time()
@@ -593,13 +647,15 @@ class RandomReplySend(_RandomEvent):
             success = False
             try:
                 settings = VoiceSender._settings(self)
-                audio = await synthesize(text.strip(), settings)
+                audio = await synthesize(spoken, settings)
                 if (not isinstance(audio, bytes) or len(audio) < 44 or len(audio) > 10 * 1024 * 1024
                         or audio[:4] != b"RIFF" or audio[8:12] != b"WAVE"):
                     return unchanged
                 updated = message.deepcopy()
                 updated.modify_message_segments([replies[0], Seg(type="voice", data=base64.b64encode(audio).decode("ascii"))], suppress_warning=True)
                 success = True
+                _watch_random_delivery(task, text=text.strip(), stream_id=message.stream_id,
+                                       target=target, scope=scope, request_id=request_id)
                 return True, True, None, None, updated
             finally:
                 await asyncio.shield(finish_random_usage(_GUARD_DB, scope, request_id, success=success))
@@ -610,11 +666,26 @@ class RandomReplySend(_RandomEvent):
             return unchanged
 
 
+class RandomReplySent(_RandomEvent):
+    event_type = EventType.AFTER_SEND
+    handler_name = "breeze_random_sent"
+    handler_description = "确认随机语音已交给发送接口"
+
+    async def execute(self, message):
+        task = self._task()
+        pending = _RANDOM_PENDING.get(task) if task is not None else None
+        segments = getattr(message, "message_segments", None)
+        if pending and isinstance(segments, list) and any(getattr(s, "type", None) == "voice" for s in segments):
+            pending["delivered"] = True
+            _RANDOM_PENDING.pop(task, None)
+        return True, True, None, None, None
+
+
 @register_plugin
 class BreezeTTSPlugin(BasePlugin):
     plugin_name = "breeze_tts_0122"
     plugin_description = "Breeze TTS 语音合成插件（MaiBot 0.12.2）"
-    plugin_version = "1.4.1"
+    plugin_version = "1.4.2"
     plugin_author = "MoonlyCake"
     enable_plugin = True
     config_file_name = "config.toml"
@@ -686,6 +757,6 @@ class BreezeTTSPlugin(BasePlugin):
         if self.get_config("general.command_enabled", True):
             result.append((BreezeCommand.get_command_info(), BreezeCommand))
         if self.get_config("breeze.random_enabled", False):
-            for handler in (RandomReplyStarted, RandomReplyGenerated, RandomReplySend):
+            for handler in (RandomReplyStarted, RandomReplyGenerated, RandomReplySend, RandomReplySent):
                 result.append((handler.get_handler_info(), handler))
         return result
