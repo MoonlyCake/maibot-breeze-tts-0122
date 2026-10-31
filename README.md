@@ -4,6 +4,8 @@
 
 **让麦麦开口说话吧！(๑•̀ㅂ•́)و✧**
 
+## ⚠️ 只适配 MaiBot 0.12.2 ⚠️
+
 [![MaiBot 0.12.2](https://img.shields.io/badge/MaiBot-0.12.2-ff9ec7)](https://github.com/MaiM-with-u/MaiBot)
 [![Version](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2FMoonlyCake%2Fmaibot-breeze-tts-0122%2Fmain%2F_manifest.json&query=%24.version&label=version&color=a0d8ef)](_manifest.json)
 [![License: MIT](https://img.shields.io/badge/license-MIT-c3e88d)](LICENSE)
