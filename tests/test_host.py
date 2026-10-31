@@ -12,10 +12,12 @@ import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 import wave
 
 import toml
+from maim_message import Seg
+from src.chat.message_receive.message import MessageRecv
 from src.plugin_system.core.plugin_manager import plugin_manager
 import src.plugin_system.base.plugin_base as host_plugin_base
 
@@ -33,7 +35,7 @@ assert fields["api_key"]["ui_type"] == "password"
 assert fields["instruction"]["ui_type"] == "textarea"
 assert schema["sections"]["general"]["fields"]["max_text_length"]["min"] == 1
 assert schema["sections"]["plugin"]["fields"]["config_version"]["hidden"] is True
-assert {"natural_enabled", "allowed_groups", "allow_private", "cooldown_seconds", "daily_max_requests"} <= set(schema["sections"]["guard"]["fields"])
+assert {"natural_enabled", "allowed_groups", "allow_private", "cooldown_seconds", "daily_max_requests", "admin_users"} <= set(schema["sections"]["guard"]["fields"])
 
 # Existing configurations have no guard section: natural Action must remain off.
 instance.config = {}
@@ -73,7 +75,7 @@ def check_old_config_migration():
         with patch.object(host_plugin_base, "logger", base_log), patch.dict(plugin_globals, {"logger": plugin_log}):
             migrated_plugin = instance.__class__(plugin_dir=str(tmpdir))
         migrated = toml.loads(config_file.read_text(encoding="utf-8"))
-        assert migrated["plugin"]["config_version"] == "1.1.0"
+        assert migrated["plugin"]["config_version"] == "1.2.0"
         assert migrated["general"]["command_enabled"] is False
         assert migrated["general"]["max_text_length"] == 123
         assert migrated["breeze"]["backend"] == "cloud"
@@ -90,15 +92,28 @@ def stream(group="123", platform="qq", stream_id=None):
                            platform=platform, stream_id=stream_id or f"{platform}-{group or 'private'}")
 
 
-def config(groups=None, cooldown=0, daily=20, allow_private=False):
+def config(groups=None, cooldown=0, daily=20, allow_private=False, admins=None):
     return {"guard": {"allowed_groups": groups if groups is not None else ["qq:123"],
                       "allow_private": allow_private, "cooldown_seconds": cooldown,
-                      "daily_max_requests": daily, "natural_enabled": True}}
+                      "daily_max_requests": daily, "natural_enabled": True,
+                      "admin_users": admins or []}}
 
 
 async def main():
     sent = []
     synthesized = []
+    generated = []
+
+    async def generate_reply(**kwargs):
+        # No real model is called: ensure the host receives the question as a
+        # target message, not the command or a fabricated history entry.
+        target = kwargs["reply_message"]
+        assert kwargs["enable_tool"] is False
+        assert kwargs["chat_stream"].stream_id == target.chat_id
+        generated.append(target.processed_plain_text)
+        return True, SimpleNamespace(processed_output=["你好"], reply_set=None)
+
+    plugin_globals["generator_api"].generate_reply = AsyncMock(side_effect=generate_reply)
 
     async def synthesis(text, settings):
         assert settings["backend"] == "self_hosted"
@@ -121,16 +136,21 @@ async def main():
     plugin_globals["get_chat_manager"] = lambda: SimpleNamespace(last_messages=latest_by_stream)
     command_ids = count()
 
-    def command(cfg, chat, text="你好", message_id=None):
+    def command(cfg, chat, text="你好", message_id=None, sender="a-test-user", segment=None):
         obj = object.__new__(command_cls)
         obj.matched_groups = re.match(obj.command_pattern, f"/breeze {text}").groupdict()
         obj.plugin_config = cfg
         if message_id is None:
             message_id = f"command-{next(command_ids)}"
         obj.message = SimpleNamespace(chat_stream=chat,
+                                      message_segment=segment or Seg(type="text", data=f"/breeze {text}"),
                                       message_info=SimpleNamespace(message_id=message_id,
                                                                    platform=chat.platform,
-                                                                   group_info=chat.group_info))
+                                                                   group_info=chat.group_info,
+                                                                   time=time.time(),
+                                                                   user_info=SimpleNamespace(user_id=sender,
+                                                                                             user_nickname="tester",
+                                                                                             platform=chat.platform)))
         obj.send_custom = send_custom
         obj.send_text = send_text
         return obj
@@ -146,6 +166,7 @@ async def main():
                                              chat_info=SimpleNamespace(platform=chat.platform,
                                                                        group_info=chat.group_info))
         latest_by_stream[chat.stream_id] = SimpleNamespace(
+            message_segment=Seg(type="text", data=request),
             message_info=SimpleNamespace(message_id=message_id, platform=chat.platform,
                                          user_info=SimpleNamespace(user_id="a-test-user")))
         obj.send_custom = send_custom
@@ -157,6 +178,7 @@ async def main():
         plugin_globals["_GUARD_DB"] = Path(tmp) / name / "usage.sqlite3"
         sent.clear()
         synthesized.clear()
+        generated.clear()
 
     with tempfile.TemporaryDirectory() as tmp:
         # The slash command still works in explicitly authorized QQ groups.
@@ -168,8 +190,204 @@ async def main():
         assert base64.b64decode(sent[0][1]["content"]) == wav
         assert synthesized == ["你好"]
         # Retried delivery of the same message ID must not trigger another call.
-        assert not (await cmd.execute())[0]
+        assert (await cmd.execute())[0]
         assert len(synthesized) == 1
+        assert generated == ["你好"]
+
+        # A command asks the actual replyer a question and speaks its answer;
+        # it never simply speaks the user's original question.
+        reset_db(tmp, "answer-not-question")
+        cmd = command(config(), stream(), text="你在做什么？")
+        assert (await cmd.execute())[0]
+        assert generated == ["你在做什么？"] and synthesized == ["你好"]
+        assert [kind for kind, _ in sent] == ["voice"]
+
+        reset_db(tmp, "reply-failed")
+        original_generator = plugin_globals["generator_api"].generate_reply
+        plugin_globals["generator_api"].generate_reply = AsyncMock(return_value=(False, None))
+        try:
+            assert not (await command(config(daily=1), stream(), text="你在做什么？").execute())[0]
+            assert not synthesized and len(sent) == 1 and sent[0][0] == "text"
+            # The reservation is deliberately not refunded on a failed model
+            # call; the next capped request must not call the model again.
+            assert not (await command(config(daily=1), stream(), text="再试一次").execute())[0]
+            assert plugin_globals["generator_api"].generate_reply.await_count == 1
+        finally:
+            plugin_globals["generator_api"].generate_reply = original_generator
+
+        reset_db(tmp, "command-synthesis-failed")
+        async def failing_synthesis(*args):
+            raise asyncio.TimeoutError()
+        plugin_globals["synthesize"] = failing_synthesis
+        try:
+            assert (await command(config(), stream()).execute())[0]
+            assert sent == [("text", "你好")]
+        finally:
+            plugin_globals["synthesize"] = synthesis
+
+        reset_db(tmp, "command-delivery-failed")
+        cmd = command(config(), stream())
+        async def command_send_failed(**kwargs):
+            sent.append(("failed_voice", kwargs))
+            return False
+        cmd.send_custom = command_send_failed
+        assert (await cmd.execute())[0]
+        assert [kind for kind, _ in sent] == ["failed_voice", "text"]
+
+        reset_db(tmp, "command-delivery-unknown")
+        cmd = command(config(), stream())
+        async def command_send_unknown(**kwargs):
+            sent.append(("unknown_voice", kwargs))
+            raise TimeoutError()
+        cmd.send_custom = command_send_unknown
+        assert (await cmd.execute())[0]
+        assert [kind for kind, _ in sent] == ["unknown_voice"]
+
+        # Exercise real 0.12.2 Seg preprocessing: bot mention becomes leading
+        # whitespace, while an at-other is stripped by the host as well.
+        receiver = object.__new__(MessageRecv)
+        receiver.is_picid = receiver.is_emoji = receiver.is_voice = False
+        mentioned = Seg(type="seglist", data=[Seg(type="mention_bot", data=1.0),
+                                               Seg(type="text", data=" /breeze 你好")])
+        processed = await receiver._process_message_segments(mentioned)
+        assert processed.startswith(" ") and re.match(command_cls.command_pattern, processed)
+        reset_db(tmp, "real-mention-bot")
+        cmd = command(config(), stream(), segment=mentioned)
+        cmd.matched_groups = re.match(cmd.command_pattern, processed).groupdict()
+        assert (await cmd.execute())[0] and synthesized == ["你好"]
+
+        original_is_bot_self = plugin_globals["is_bot_self"]
+        plugin_globals["is_bot_self"] = lambda platform, sender: platform == "qq" and sender == "9999"
+        try:
+            other = Seg(type="seglist", data=[Seg(type="at", data={"target_user_id": "8888"}),
+                                             Seg(type="text", data=" /breeze 你好")])
+            processed = await receiver._process_message_segments(other)
+            assert re.match(command_cls.command_pattern, processed)
+            reset_db(tmp, "real-mention-other")
+            cmd = command(config(), stream(), segment=other)
+            cmd.matched_groups = re.match(cmd.command_pattern, processed).groupdict()
+            assert (await cmd.execute())[2] == 0 and not synthesized and not generated
+
+            own = Seg(type="seglist", data=[Seg(type="at", data={"target_user_id": "9999"}),
+                                           Seg(type="text", data=" /breeze 你好")])
+            processed = await receiver._process_message_segments(own)
+            reset_db(tmp, "real-mention-self")
+            cmd = command(config(), stream(), segment=own)
+            cmd.matched_groups = re.match(cmd.command_pattern, processed).groupdict()
+            assert (await cmd.execute())[0] and synthesized == ["你好"]
+
+            unknown = Seg(type="seglist", data=[Seg(type="at", data={}),
+                                               Seg(type="text", data=" /breeze 你好")])
+            reset_db(tmp, "real-mention-unknown")
+            assert (await command(config(), stream(), segment=unknown).execute())[2] == 0
+            assert not synthesized and not generated
+        finally:
+            plugin_globals["is_bot_self"] = original_is_bot_self
+
+        # The processed description of an image or voice may contain command
+        # text, but only a pure text command may trigger paid operations.
+        reset_db(tmp, "vlm-injected-command")
+        image_injection = Seg(type="seglist", data=[Seg(type="image", data="mock-image"),
+                                                    Seg(type="text", data="normal message")])
+        cmd = command(config(), stream(), segment=image_injection)
+        assert (await cmd.execute())[2] == 0
+        assert not generated and not synthesized and not sent
+        assert not plugin_globals["_GUARD_DB"].exists()
+        reset_db(tmp, "mixed-attachment-command")
+        mixed = Seg(type="seglist", data=[Seg(type="image", data="mock-image"),
+                                          Seg(type="text", data="/breeze 你好")])
+        cmd = command(config(), stream(), segment=mixed)
+        assert (await cmd.execute())[2] == 0
+        assert not generated and not synthesized and not sent
+        assert not plugin_globals["_GUARD_DB"].exists()
+        reset_db(tmp, "mismatched-raw-command")
+        cmd = command(config(), stream(), segment=Seg(type="text", data="/breeze 别的问题"))
+        assert (await cmd.execute())[2] == 0
+        assert not generated and not synthesized and not sent
+        assert not plugin_globals["_GUARD_DB"].exists()
+
+        # Text that merely contains a command remains ordinary conversation.
+        assert re.match(command_cls.command_pattern, "讨论 /breeze 你好") is None
+
+        # Execute through the real 0.12.2 ChatBot routing function: it marks a
+        # regex match as is_command before invoking the plugin. A pass-through
+        # case must undo that mark so ordinary chat handling is not suppressed.
+        from src.chat.message_receive import bot as host_bot
+        host = object.__new__(host_bot.ChatBot)
+        info = SimpleNamespace(plugin_name="breeze_tts_0122", name="breeze_tts_command")
+
+        def find_test_command(text):
+            match = re.match(command_cls.command_pattern, text)
+            return (command_cls, match.groupdict(), info) if match else None
+
+        def real_incoming(message_id, segment):
+            msg = MessageRecv({"message_info": {"platform": "qq", "message_id": message_id,
+                                                "time": time.time(),
+                                                "user_info": {"platform": "qq", "user_id": "271828", "user_nickname": "tester"},
+                                                "group_info": {"group_id": "123", "group_name": "test"}},
+                               "message_segment": segment.to_dict()})
+            msg.update_chat_stream(stream())
+            return msg
+
+        with patch.object(host_bot.component_registry, "find_command_by_text", side_effect=find_test_command), \
+             patch.object(host_bot.component_registry, "get_plugin_config", return_value=config()), \
+             patch.object(host_bot.global_announcement_manager, "get_disabled_chat_commands", return_value=[]), \
+             patch.dict(plugin_globals, {"is_bot_self": lambda platform, sender: platform == "qq" and sender == "9999"}):
+            for name, segment, forged_processed in (
+                ("host-at-other", Seg(type="seglist", data=[Seg(type="at", data={"target_user_id": "8888"}),
+                                                           Seg(type="text", data=" /breeze 你好")]), None),
+                ("host-image", Seg(type="image", data="mock-image"), "/breeze 你好"),
+                ("host-voice", Seg(type="voice", data="mock-voice"), "/breeze 你好"),
+                ("host-inconsistent-text", Seg(type="text", data="/breeze 不同的问题"), "/breeze 你好"),
+            ):
+                reset_db(tmp, name)
+                msg = real_incoming(name, segment)
+                if forged_processed is None:
+                    await msg.process()
+                else:
+                    msg.processed_plain_text = forged_processed
+                assert not msg.is_command
+                found, _, continue_processing = await host._process_commands(msg)
+                assert found and continue_processing
+                assert msg.is_command is False and msg.intercept_message_level == 0
+                assert not synthesized and not generated and not sent
+                assert not plugin_globals["_GUARD_DB"].exists()
+
+            # Unknown chat scope also returns the message to normal handling.
+            reset_db(tmp, "host-missing-scope")
+            msg = real_incoming("host-missing-scope", Seg(type="text", data="/breeze 你好"))
+            await msg.process()
+            msg.chat_stream.platform = "discord"
+            found, _, continue_processing = await host._process_commands(msg)
+            assert found and continue_processing
+            assert msg.is_command is False and msg.intercept_message_level == 0
+            assert not synthesized and not generated and not sent
+
+        # Admins bypass cooldown/daily budget, not scope or message dedup;
+        # their requests do not consume ordinary users' quota.
+        reset_db(tmp, "admin-exemption")
+        cfg = config(cooldown=60, daily=1, admins=["314159"])
+        normal = command(cfg, stream(), sender="271828")
+        assert (await normal.execute())[0] and len(synthesized) == 1
+        admin = command(cfg, stream(), sender="314159", message_id="admin-1")
+        assert (await admin.execute())[0] and len(synthesized) == 2
+        assert (await admin.execute())[0] and len(synthesized) == 2
+        assert (await command(cfg, stream(), sender="314159", message_id="admin-2").execute())[0]
+        assert len(synthesized) == 3
+        assert not (await command(cfg, stream(), sender="271828", message_id="normal-2").execute())[0]
+        assert len(synthesized) == 3 and sent[-1][0] == "text"
+        assert generated == ["你好", "你好", "你好"]
+        reset_db(tmp, "admin-out-of-scope")
+        assert not (await command(config(groups=[], admins=["314159"]), stream(), sender="314159").execute())[0]
+        assert not synthesized and not generated
+        reset_db(tmp, "admin-platform-mismatch")
+        cfg = config(daily=1, admins=["314159"])
+        assert (await command(cfg, stream(), sender="271828").execute())[0]
+        spoof = command(cfg, stream(), sender="314159")
+        spoof.message.message_info.user_info.platform = "discord"
+        assert not (await spoof.execute())[0]
+        assert len(synthesized) == 1 and sent[-1][0] == "text"
+        assert generated == ["你好"]
 
         # No message ID is not sufficient to safely deduplicate a paid request.
         reset_db(tmp, "no-id")
@@ -218,16 +436,25 @@ async def main():
         assert not (await mismatch.execute())[0]
         assert not synthesized and all(kind != "voice" for kind, _ in sent)
 
-        # Planner Action sends text first, then voice, once for an explicit request.
+        # Planner Action sends only voice on success, once for an explicit request.
         reset_db(tmp, "action")
         obj = action(config(), stream())
         assert (await obj.execute())[0]
-        assert [kind for kind, _ in sent] == ["text", "voice", "stored"]
-        assert sent[0][1] == "你好" and synthesized == ["你好"]
+        assert [kind for kind, _ in sent] == ["voice", "stored"]
+        assert synthesized == ["你好"]
         assert (await obj.execute())[0]
-        assert [kind for kind, _ in sent] == ["text", "voice", "stored"]
+        assert [kind for kind, _ in sent] == ["voice", "stored"]
 
         # An expired/non-explicit planner target produces text, not chargeable audio.
+        for kind in ("image", "voice"):
+            reset_db(tmp, f"natural-{kind}-injection")
+            chat = stream()
+            obj = action(config(), chat)
+            # The database's processed text might be synthesized by a vision
+            # model or speech recognizer; raw attachment isn't user text.
+            latest_by_stream[chat.stream_id].message_segment = Seg(type=kind, data="mock-attachment")
+            assert (await obj.execute())[0]
+            assert [tag for tag, _ in sent] == ["text", "stored"] and not synthesized
         reset_db(tmp, "no-intent")
         obj = action(config(), stream(), request="这段语音真有趣")
         assert (await obj.execute())[0]
@@ -311,15 +538,26 @@ async def main():
             return False
         obj.send_custom = fail_send
         assert (await obj.execute())[0]
-        assert [kind for kind, _ in sent] == ["text", "failed_voice", "stored"]
+        assert [kind for kind, _ in sent] == ["failed_voice", "text", "stored"]
+        # A send exception leaves delivery unknown; do not blindly duplicate it.
+        reset_db(tmp, "delivery-unknown")
+        obj = action(config(), stream())
+        async def unknown_send(**kw):
+            sent.append(("unknown_voice", kw))
+            raise RuntimeError("delivery status unavailable")
+        obj.send_custom = unknown_send
+        assert (await obj.execute())[0]
+        assert [kind for kind, _ in sent] == ["unknown_voice", "stored"]
         reset_db(tmp, "text-delivery")
         obj = action(config(), stream())
         async def fail_text(text):
             sent.append(("failed_text", text))
             return False
+        plugin_globals["synthesize"] = timeout
         obj.send_text = fail_text
         assert not (await obj.execute())[0]
         assert [kind for kind, _ in sent] == ["failed_text"] and not synthesized
+        plugin_globals["synthesize"] = synthesis
 
         # Rejected scope and exhausted quota retain text; no cloud call is made.
         reset_db(tmp, "action-scope")
@@ -332,12 +570,24 @@ async def main():
         assert [kind for kind, _ in sent] == ["text", "stored"]
         assert synthesized == ["你好"]
 
+        # Action-admin identity comes from its verified message, not the LLM.
+        reset_db(tmp, "action-admin")
+        cfg = config(daily=1, cooldown=60, admins=["qq:a-test-user"])
+        assert (await command(cfg, stream(), sender="271828").execute())[0]
+        sent.clear()
+        obj = action(cfg, stream(), message_id="admin-action")
+        assert (await obj.execute())[0]
+        assert [kind for kind, _ in sent] == ["voice", "stored"]
+        assert (await obj.execute())[0]
+        assert [kind for kind, _ in sent] == ["voice", "stored"]
+
         # Shared daily quota remains atomic for concurrent commands in two groups.
         reset_db(tmp, "concurrent")
         cfg = config(groups=["qq:123", "qq:456"], daily=1)
         results = await asyncio.gather(command(cfg, stream("123")).execute(),
                                        command(cfg, stream("456")).execute())
-        assert sum(bool(item[0]) for item in results) == 1
+        assert sum(kind == "voice" for kind, _ in sent) == 1
+        assert sum(kind == "text" for kind, _ in sent) == 1
         assert len(synthesized) == 1
 
         # Zero daily limit means unlimited, while cooldown still applies.
@@ -350,6 +600,7 @@ async def main():
         cfg = config(cooldown=60, daily=0)
         assert (await command(cfg, stream()).execute())[0]
         assert not (await command(cfg, stream()).execute())[0]
+        assert sum(kind == "text" for kind, _ in sent) == 1
         assert len(synthesized) == 1
 
     print("PASS: MaiBot 0.12.2 plugin loading, WebUI schema, scope, concurrent limits, command and text fallback")

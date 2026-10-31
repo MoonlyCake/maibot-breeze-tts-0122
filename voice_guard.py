@@ -57,6 +57,38 @@ def scope_allowed(
     return False
 
 
+def is_admin(platform: str, user_id: str | int | None, admin_users: Sequence[str]) -> bool:
+    """Match a trusted sender against a configured platform-qualified allowlist.
+
+    Bare numeric identifiers apply only to QQ, as with group allowlists. An
+    empty or malformed platform, user ID or list can never grant an exemption.
+    """
+    if not isinstance(platform, str):
+        return False
+    platform = platform.strip().lower()
+    if (not re.fullmatch(r"[a-z][a-z0-9_.-]{0,63}", platform)
+            or platform in {"unknown", "none", "null", "undefined"}):
+        return False
+    if not isinstance(user_id, (str, int)) or isinstance(user_id, bool):
+        return False
+    target = str(user_id).strip()
+    if not target or len(target) > 256 or ":" in target or any(ord(c) < 32 for c in target):
+        return False
+    if not isinstance(admin_users, (list, tuple)):
+        return False
+    for item in admin_users:
+        if not isinstance(item, str):
+            continue
+        entry = item.strip()
+        if ":" in entry:
+            entry_platform, entry_id = entry.split(":", 1)
+            if entry_platform.strip().lower() == platform and entry_id.strip() == target:
+                return True
+        elif platform == "qq" and re.fullmatch(r"[0-9]+", entry) and entry == target:
+            return True
+    return False
+
+
 def _valid_nonnegative_int(value: object, maximum: int) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= maximum
 
@@ -89,6 +121,7 @@ def _reserve(
     daily_max_requests: int,
     request_id: str | None,
     now: datetime | None,
+    bypass_limits: bool,
 ) -> tuple[bool, str]:
     if not isinstance(session_key, str) or not session_key.strip():
         return False, "invalid_config"
@@ -99,6 +132,8 @@ def _reserve(
     if not _valid_nonnegative_int(daily_max_requests, 1_000_000):
         return False, "invalid_config"
     if request_id is not None and (not isinstance(request_id, str) or not request_id.strip()):
+        return False, "invalid_config"
+    if not isinstance(bypass_limits, bool) or (bypass_limits and request_id is None):
         return False, "invalid_config"
     if now is not None and not isinstance(now, datetime):
         return False, "invalid_config"
@@ -119,18 +154,19 @@ def _reserve(
             if event and db.execute("SELECT 1 FROM seen_requests WHERE event_hash = ?", (event,)).fetchone():
                 db.rollback()
                 return False, "duplicate"
-            daily = db.execute("SELECT attempts FROM daily_usage WHERE day = ?", (day,)).fetchone()
-            if daily_max_requests > 0 and daily and daily[0] >= daily_max_requests:
-                db.rollback()
-                return False, "daily_limit"
-            last = db.execute("SELECT last_attempt FROM cooldowns WHERE scope_hash = ?", (scope,)).fetchone()
-            if last and cooldown_seconds and timestamp - last[0] < cooldown_seconds:
-                db.rollback()
-                return False, "cooldown"
-            db.execute("INSERT INTO daily_usage(day, attempts) VALUES (?, 1) "
-                       "ON CONFLICT(day) DO UPDATE SET attempts = attempts + 1", (day,))
-            db.execute("INSERT INTO cooldowns(scope_hash, last_attempt) VALUES (?, ?) "
-                       "ON CONFLICT(scope_hash) DO UPDATE SET last_attempt = excluded.last_attempt", (scope, timestamp))
+            if not bypass_limits:
+                daily = db.execute("SELECT attempts FROM daily_usage WHERE day = ?", (day,)).fetchone()
+                if daily_max_requests > 0 and daily and daily[0] >= daily_max_requests:
+                    db.rollback()
+                    return False, "daily_limit"
+                last = db.execute("SELECT last_attempt FROM cooldowns WHERE scope_hash = ?", (scope,)).fetchone()
+                if last and cooldown_seconds and timestamp - last[0] < cooldown_seconds:
+                    db.rollback()
+                    return False, "cooldown"
+                db.execute("INSERT INTO daily_usage(day, attempts) VALUES (?, 1) "
+                           "ON CONFLICT(day) DO UPDATE SET attempts = attempts + 1", (day,))
+                db.execute("INSERT INTO cooldowns(scope_hash, last_attempt) VALUES (?, ?) "
+                           "ON CONFLICT(scope_hash) DO UPDATE SET last_attempt = excluded.last_attempt", (scope, timestamp))
             if event:
                 db.execute("INSERT INTO seen_requests(event_hash, created) VALUES (?, ?)", (event, timestamp))
             db.commit()
@@ -147,16 +183,20 @@ async def reserve_usage(
     request_id: str | None = None,
     *,
     now: datetime | None = None,
+    bypass_limits: bool = False,
 ) -> tuple[bool, str]:
     """Atomically reserve one attempt, off the event loop.
 
     Zero daily limit disables the cap, while attempts are still counted;
     zero cooldown disables cooldown.
     Once reserved, an attempt is never refunded, including on cancellation.
-    ``request_id`` is optional and, when set, prevents reuse for seven days.
+    ``request_id`` prevents reuse for seven days. An administrator exemption
+    requires a request ID, does not consume normal quota or advance cooldown,
+    and still fails closed if validation or persistent storage fails. Scope
+    and administrator identity must be verified by the caller.
     """
     return await asyncio.to_thread(_reserve, db_path, session_key, cooldown_seconds,
-                                   daily_max_requests, request_id, now)
+                                   daily_max_requests, request_id, now, bypass_limits)
 
 
 def _claim_request(db_path: str | Path, session_key: str, request_id: str,
@@ -188,6 +228,8 @@ async def claim_request(db_path: str | Path, session_key: str, request_id: str,
 
     This separate claim prevents repeated text fallbacks when an old host
     repeatedly plans the same message. Follow it with ``reserve_usage`` using
-    no request_id. Claims never consume the daily voice-attempt quota.
+    a stable ID in a separate namespace, such as ``voice:<message_id>``. An
+    administrator exemption requires that reservation ID. Claims never consume
+    the daily voice-attempt quota.
     """
     return await asyncio.to_thread(_claim_request, db_path, session_key, request_id, now)
