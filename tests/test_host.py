@@ -276,6 +276,25 @@ async def main():
             cmd.matched_groups = re.match(cmd.command_pattern, processed).groupdict()
             assert (await cmd.execute())[0] and synthesized == ["你好"]
 
+            # Some adapter variants render the actual mention in processed
+            # text. Accept that presentation only when the original Seg also
+            # contains the verified bot mention.
+            reset_db(tmp, "rendered-mention")
+            cmd = command(config(), stream(), segment=own)
+            cmd.matched_groups = re.match(cmd.command_pattern, "[@9999] /breeze 你好").groupdict()
+            assert (await cmd.execute())[0] and synthesized == ["你好"]
+            reset_db(tmp, "rendered-mention-case-insensitive")
+            upper = Seg(type="seglist", data=[Seg(type="at", data={"target_user_id": "9999"}),
+                                              Seg(type="text", data=" /BREEZE 你好")])
+            cmd = command(config(), stream(), segment=upper)
+            cmd.matched_groups = re.match(cmd.command_pattern, "[@9999] /BREEZE 你好", re.IGNORECASE).groupdict()
+            assert (await cmd.execute())[0] and synthesized == ["你好"]
+            reset_db(tmp, "fake-rendered-mention")
+            fake = Seg(type="text", data="[@9999] /breeze 你好")
+            cmd = command(config(), stream(), segment=fake)
+            cmd.matched_groups = re.match(cmd.command_pattern, fake.data).groupdict()
+            assert (await cmd.execute())[2] == 0 and not synthesized and not generated
+
             unknown = Seg(type="seglist", data=[Seg(type="at", data={}),
                                                Seg(type="text", data=" /breeze 你好")])
             reset_db(tmp, "real-mention-unknown")
@@ -445,6 +464,67 @@ async def main():
         assert (await obj.execute())[0]
         assert [kind for kind, _ in sent] == ["voice", "stored"]
 
+        # If the host sends an @ + slash request through Planner instead of
+        # command routing, recognize it only from the real, current Seg.
+        original_is_bot_self = plugin_globals["is_bot_self"]
+        plugin_globals["is_bot_self"] = lambda platform, sender: platform == "qq" and sender == "9999"
+        try:
+            reset_db(tmp, "action-mention-command")
+            chat = stream()
+            obj = action(config(), chat, request="[@9999] /breeze 你在做什么", answer="我在看群聊")
+            latest_by_stream[chat.stream_id].message_segment = Seg(type="seglist", data=[
+                Seg(type="at", data={"target_user_id": "9999"}), Seg(type="text", data=" /breeze 你在做什么")])
+            assert (await obj.execute())[0]
+            assert synthesized == ["我在看群聊"] and [kind for kind, _ in sent] == ["voice", "stored"]
+            reset_db(tmp, "action-uppercase-mention-command")
+            obj = action(config(), chat, request="[@9999] /BREEZE 你在做什么", answer="我在看群聊")
+            latest_by_stream[chat.stream_id].message_segment = Seg(type="seglist", data=[
+                Seg(type="at", data={"target_user_id": "9999"}), Seg(type="text", data=" /BREEZE 你在做什么")])
+            assert (await obj.execute())[0] and synthesized == ["我在看群聊"]
+            reset_db(tmp, "action-other-mention-command")
+            obj = action(config(), chat, request="[@8888] /breeze 你在做什么")
+            latest_by_stream[chat.stream_id].message_segment = Seg(type="seglist", data=[
+                Seg(type="at", data={"target_user_id": "8888"}), Seg(type="text", data=" /breeze 你在做什么")])
+            assert (await obj.execute())[0] and not synthesized
+            assert [kind for kind, _ in sent] == ["text", "stored"]
+            reset_db(tmp, "action-forged-mention-command")
+            obj = action(config(), chat, request="[@9999] /breeze 你在做什么")
+            assert (await obj.execute())[0] and not synthesized
+            reset_db(tmp, "action-disabled-command")
+            cfg = config(); cfg["general"] = {"command_enabled": False}
+            obj = action(cfg, chat, request="/breeze 你在做什么")
+            assert (await obj.execute())[0] and not synthesized
+        finally:
+            plugin_globals["is_bot_self"] = original_is_bot_self
+
+        # Planner may omit text; generate a contextual answer and never speak
+        # the user's question as if it were the answer.
+        reset_db(tmp, "empty-action-generates")
+        obj = action(config(), stream(), request="请用语音回答我", answer="")
+        assert (await obj.execute())[0]
+        assert generated == ["请用语音回答我"] and synthesized == ["你好"]
+        assert [kind for kind, _ in sent] == ["voice", "stored"]
+        for index, result in enumerate(((False, None), RuntimeError("synthetic failure"))):
+            reset_db(tmp, f"empty-action-generation-error-{index}")
+            old = plugin_globals["generator_api"].generate_reply
+            plugin_globals["generator_api"].generate_reply = AsyncMock(side_effect=result) if isinstance(result, Exception) else AsyncMock(return_value=result)
+            try:
+                assert not (await action(config(), stream(), answer="").execute())[0]
+                assert [kind for kind, _ in sent] == ["text"] and not synthesized
+            finally:
+                plugin_globals["generator_api"].generate_reply = old
+        reset_db(tmp, "empty-action-denied-scope")
+        assert (await action(config(groups=[]), stream(), answer="").execute())[0]
+        assert [kind for kind, _ in sent] == ["text", "stored"] and not synthesized and not generated
+        reset_db(tmp, "empty-action-quota-send-failure")
+        assert (await command(config(daily=1), stream()).execute())[0]
+        sent.clear(); generated.clear(); synthesized.clear()
+        obj = action(config(daily=1), stream(), message_id="new-action", answer="")
+        obj.send_text = AsyncMock(return_value=False)
+        ok, reason = await obj.execute()
+        assert not ok and reason == "文字回复发送失败" and not generated and not synthesized
+        obj.send_text.assert_awaited_once()
+
         # An expired/non-explicit planner target produces text, not chargeable audio.
         for kind in ("image", "voice"):
             reset_db(tmp, f"natural-{kind}-injection")
@@ -457,6 +537,10 @@ async def main():
             assert [tag for tag, _ in sent] == ["text", "stored"] and not synthesized
         reset_db(tmp, "no-intent")
         obj = action(config(), stream(), request="这段语音真有趣")
+        assert (await obj.execute())[0]
+        assert [kind for kind, _ in sent] == ["text", "stored"] and not synthesized
+        reset_db(tmp, "natural-explicit-text-only")
+        obj = action(config(), stream(), request="用语音回答，但这次只用文字")
         assert (await obj.execute())[0]
         assert [kind for kind, _ in sent] == ["text", "stored"] and not synthesized
         reset_db(tmp, "action-group-mismatch")

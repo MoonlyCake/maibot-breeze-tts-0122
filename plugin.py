@@ -32,6 +32,7 @@ from .voice_guard import claim_request, finish_random_usage, is_admin, reserve_u
 logger = get_logger("breeze_tts_0122")
 _GUARD_DB = Path(__file__).resolve().parent / "voice_guard_data" / "usage.sqlite3"
 _RANDOM_TASKS = weakref.WeakKeyDictionary()
+_RAW_COMMAND_PATTERN = r"^\s*/breeze(?:\s+(?P<text>[\s\S]+?))?\s*$"
 
 
 async def _release_cancelled_random(reservation, scope, request_id):
@@ -119,9 +120,9 @@ def _voice_denied(text):
                for clause in re.split(r"[，,。.!！?？；;\n]", text.casefold()))
 
 
-def _fresh_voice_message(message, stream_id, platform):
+def _fresh_voice_message(message, stream_id, platform, *, command_enabled=True):
     """Planner targets may come from old history; require a recent identified message."""
-    if message is None or not _explicit_voice_request(getattr(message, "processed_plain_text", "")):
+    if message is None:
         return False
     if not str(getattr(message, "message_id", "") or ""):
         return False
@@ -153,15 +154,43 @@ def _fresh_voice_message(message, stream_id, platform):
         latest_platform = str(info.platform or "").strip()
         segment = getattr(latest, "message_segment", None)
         raw_text = _raw_command_text(segment)
+        natural = (_explicit_voice_request(getattr(message, "processed_plain_text", ""))
+                   and _explicit_voice_request(raw_text) and not _voice_denied(raw_text))
+        # Some adapters expose a rendered @ prefix in processed_plain_text;
+        # only the verified raw Seg may authorize a slash command.
+        command_match = re.match(_RAW_COMMAND_PATTERN, raw_text, re.IGNORECASE) if raw_text else None
+        command = bool(command_enabled and command_match and (command_match.group("text") or "").strip())
         return bool(latest_id == str(message.message_id).strip() and latest_sender == sender
                     and latest_platform == platform and raw_text is not None
-                    and _mentions_only_bot(segment, platform) and _explicit_voice_request(raw_text))
+                    and _mentions_only_bot(segment, platform) and (natural or command))
     except Exception:
         # Unknown live context is not a safe reason to spend or send voice.
         return False
 
 
 class VoiceSender:
+    async def _generate_context_reply(self, target):
+        """Generate an answer against the host's actual conversation target."""
+        ok, result = await asyncio.wait_for(generator_api.generate_reply(
+            chat_stream=getattr(self, "chat_stream", None) or self.message.chat_stream, reply_message=target,
+            reply_reason="用户请求用语音回答问题", enable_tool=False,
+            enable_splitter=False, enable_chinese_typo=False,
+            request_type="breeze_tts", from_plugin=True,
+        ), timeout=120)
+        if not ok or result is None:
+            return None
+        parts = getattr(result, "processed_output", None)
+        if isinstance(parts, list):
+            answer = "\n".join(part.strip() for part in parts if isinstance(part, str) and part.strip())
+            if answer:
+                return answer
+        reply_set = getattr(result, "reply_set", None)
+        reply_data = getattr(reply_set, "reply_data", [])
+        texts = [part.content.strip() for part in reply_data
+                 if isinstance(getattr(part, "content", None), str) and part.content.strip()
+                 and str(getattr(getattr(part, "content_type", None), "value", getattr(part, "content_type", ""))) == "text"]
+        return "\n".join(texts) or None
+
     def _scope(self):
         stream = getattr(self, "chat_stream", None)
         if stream is None:
@@ -291,22 +320,22 @@ class BreezeAction(VoiceSender, BaseAction):
     action_name = "breeze_tts_action"
     action_description = "在用户要求语音时，将回复内容合成为语音"
     activation_type = ActionActivationType.KEYWORD
-    activation_keywords = ["语音", "声音", "朗读", "读出来", "念出来", "说出来", "给我听", "voice", "aloud"]
+    activation_keywords = ["语音", "声音", "朗读", "读出来", "念出来", "说出来", "给我听", "voice", "aloud", "/breeze"]
     keyword_case_sensitive = False
     mode_enable = ChatMode.ALL
     parallel_action = False
     associated_types = ["text"]
     action_parameters = {"text": "要以语音回复给用户的完整文字"}
-    action_require = ["用户明确要求语音回复或朗读时使用", "text 必须是需要说出的具体内容"]
+    action_require = ["用户明确要求语音回复、朗读，或发送 /breeze 问题时使用", "text 必须是你生成的回答，不要照读用户的问题"]
 
     async def execute(self):
-        text = self.action_data.get("text", "")
-        if not isinstance(text, str) or not text.strip():
-            return False, "没有可发送的回复文字"
-        text = text.strip()
+        data = getattr(self, "action_data", None)
+        text = data.get("text", "") if isinstance(data, dict) else ""
+        text = text.strip() if isinstance(text, str) else ""
         scope = self._scope()
         target = getattr(self, "action_message", None)
-        fresh_voice = bool(scope is not None and _fresh_voice_message(target, scope[1], scope[0]))
+        fresh_voice = bool(scope is not None and _fresh_voice_message(
+            target, scope[1], scope[0], command_enabled=self.get_config("general.command_enabled", True)))
         # A 0.12.2 planner can select the same historical target repeatedly.
         # Claim it before sending text so denied TTS does not spam fallbacks.
         claim_ok = False
@@ -319,13 +348,34 @@ class BreezeAction(VoiceSender, BaseAction):
             except Exception as exc:
                 logger.warning(f"Breeze TTS message guard failed: {type(exc).__name__}")
         if not claim_ok or scope is None or not scope[2] or not fresh_voice:
-            if not await self.send_text(text):
+            logger.info("Breeze Action skipped speech: request or scope not verified")
+            if not await self.send_text(text or "抱歉，暂时无法生成回复，请稍后再试。"):
                 return False, "文字回复发送失败"
             await self.store_action_info(action_build_into_prompt=True,
                                          action_prompt_display="已发送文字回复",
                                          action_done=True)
             return True, "已发送文字回复"
-        ok, message = await self._speak(text, request_id="voice:" + message_id)
+        pre_reserved = False
+        if not text:
+            allowed, reason = await self._reserve(scope, "voice:" + message_id)
+            if not allowed:
+                logger.info(f"Breeze Action reply generation skipped: {reason}")
+                if not await self.send_text("抱歉，暂时无法生成语音回复，请稍后再试。"):
+                    return False, "文字回复发送失败"
+                return False, self._limit_message(reason)
+            pre_reserved = True
+            try:
+                text = await self._generate_context_reply(target)
+            except Exception as exc:
+                logger.warning(f"Breeze TTS reply generation failed: {type(exc).__name__}")
+                text = None
+            if not text:
+                if not await self.send_text("抱歉，暂时无法生成回复，请稍后再试。"):
+                    return False, "文字回复发送失败"
+                return False, "回复生成失败，已发送文字提示"
+        ok, message = await self._speak(text, request_id="voice:" + message_id, pre_reserved=pre_reserved)
+        if ok is False:
+            logger.info(f"Breeze Action speech unavailable: {message}")
         if ok is False and not await self.send_text(text):
             return False, "语音及文字回复发送失败"
         await self.store_action_info(action_build_into_prompt=True,
@@ -337,7 +387,7 @@ class BreezeAction(VoiceSender, BaseAction):
 class BreezeCommand(VoiceSender, BaseCommand):
     command_name = "breeze_tts_command"
     command_description = "让麦麦回答问题并尝试发送语音"
-    command_pattern = r"^\s*/breeze(?:\s+(?P<text>[\s\S]+?))?\s*$"
+    command_pattern = r"^\s*(?:\[@[^\]\n]{1,128}\]\s*)?/breeze(?:\s+(?P<text>[\s\S]+?))?\s*$"
     command_help = "/breeze <问题>：让麦麦回答并发送语音"
     command_examples = ["/breeze 你在做什么？"]
 
@@ -359,25 +409,7 @@ class BreezeCommand(VoiceSender, BaseCommand):
             chat_info_group_id=str(getattr(group, "group_id", "") or "") or None,
             chat_info_group_name=str(getattr(group, "group_name", "") or "") or None,
         )
-        ok, result = await asyncio.wait_for(generator_api.generate_reply(
-            chat_stream=incoming.chat_stream, reply_message=target,
-            reply_reason="用户请求用语音回答问题", enable_tool=False,
-            enable_splitter=False, enable_chinese_typo=False,
-            request_type="breeze_tts", from_plugin=True,
-        ), timeout=120)
-        if not ok or result is None:
-            return None
-        parts = getattr(result, "processed_output", None)
-        if isinstance(parts, list):
-            answer = "\n".join(part.strip() for part in parts if isinstance(part, str) and part.strip())
-            if answer:
-                return answer
-        reply_set = getattr(result, "reply_set", None)
-        reply_data = getattr(reply_set, "reply_data", [])
-        texts = [part.content.strip() for part in reply_data
-                 if isinstance(getattr(part, "content", None), str) and part.content.strip()
-                 and str(getattr(getattr(part, "content_type", None), "value", getattr(part, "content_type", ""))) == "text"]
-        return "\n".join(texts) or None
+        return await self._generate_context_reply(target)
 
     async def execute(self):
         text = (self.matched_groups.get("text") or "").strip()
@@ -392,7 +424,7 @@ class BreezeCommand(VoiceSender, BaseCommand):
             incoming.is_command = False
             return True, "未提及本机器人", 0
         raw_text = _raw_command_text(getattr(incoming, "message_segment", None))
-        raw_match = re.match(self.command_pattern, raw_text) if raw_text is not None else None
+        raw_match = re.match(_RAW_COMMAND_PATTERN, raw_text, re.IGNORECASE) if raw_text is not None else None
         if not raw_match or (raw_match.group("text") or "").strip() != text:
             incoming.is_command = False
             return True, "不是纯文字语音命令", 0
@@ -582,7 +614,7 @@ class RandomReplySend(_RandomEvent):
 class BreezeTTSPlugin(BasePlugin):
     plugin_name = "breeze_tts_0122"
     plugin_description = "Breeze TTS 语音合成插件（MaiBot 0.12.2）"
-    plugin_version = "1.4.0"
+    plugin_version = "1.4.1"
     plugin_author = "MoonlyCake"
     enable_plugin = True
     config_file_name = "config.toml"
