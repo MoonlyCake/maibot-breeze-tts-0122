@@ -1,0 +1,43 @@
+{
+  "manifest_version": 1,
+  "id": "community.breeze_tts_0122",
+  "name": "Breeze TTS for MaiBot 0.12.2",
+  "version": "1.0.0",
+  "description": "使用 Breeze TTS 生成语音，适配 MaiBot 0.12.2。",
+  "author": {
+    "name": "MoonlyCake",
+    "url": "https://github.com/MoonlyCake"
+  },
+  "license": "MIT",
+  "host_application": {
+    "min_version": "0.12.2"
+  },
+  "default_locale": "zh-CN",
+  "keywords": [
+    "TTS",
+    "语音",
+    "Breeze"
+  ],
+  "categories": [
+    "语音",
+    "聊天增强"
+  ],
+  "plugin_info": {
+    "is_built_in": false,
+    "plugin_type": "general",
+    "components": [
+      {
+        "type": "action",
+        "name": "breeze_tts_action",
+        "description": "按对话需要语音回复"
+      },
+      {
+        "type": "command",
+        "name": "breeze_tts_command",
+        "description": "手动合成语音"
+      }
+    ]
+  },
+  "repository_url": "https://github.com/MoonlyCake/maibot-breeze-tts-0122",
+  "homepage_url": "https://github.com/MoonlyCake/maibot-breeze-tts-0122"
+}
