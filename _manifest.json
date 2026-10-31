@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "id": "community.breeze_tts_0122",
   "name": "Breeze TTS for MaiBot 0.12.2",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "使用 Breeze TTS 生成语音，适配 MaiBot 0.12.2。",
   "author": {
     "name": "MoonlyCake",

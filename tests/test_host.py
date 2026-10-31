@@ -11,6 +11,16 @@ assert plugin_manager._load_plugin_module_file("plugins/breeze_tts_0122/plugin.p
 ok, _ = plugin_manager.load_registered_plugin_classes("breeze_tts_0122")
 assert ok, plugin_manager.failed_plugins
 instance = plugin_manager.loaded_plugins["breeze_tts_0122"]
+schema = instance.get_webui_config_schema()
+assert schema["layout"]["type"] == "tabs"
+assert {tab["id"] for tab in schema["layout"]["tabs"]} == {"general", "service"}
+fields = schema["sections"]["breeze"]["fields"]
+assert fields["backend"]["ui_type"] == "select"
+assert fields["backend"]["choices"] == ["self_hosted", "cloud"]
+assert fields["api_key"]["ui_type"] == "password"
+assert fields["instruction"]["ui_type"] == "textarea"
+assert schema["sections"]["general"]["fields"]["max_text_length"]["min"] == 1
+assert schema["sections"]["plugin"]["fields"]["config_version"]["hidden"] is True
 components = {info.name: cls for info, cls in instance.get_plugin_components()}
 command_cls = components["breeze_tts_command"]
 action_cls = components["breeze_tts_action"]
@@ -65,6 +75,6 @@ async def main():
     async def invalid(*args): return b"invalid"
     plugin_globals["synthesize"] = invalid
     assert not (await cmd.execute())[0]
-    print("PASS: MaiBot 0.12.2 plugin registration, command and action routes, WAV send, limits and errors")
+    print("PASS: MaiBot 0.12.2 plugin registration, WebUI schema, command and action routes, WAV send, limits and errors")
 
 asyncio.run(main())

@@ -1,4 +1,5 @@
 config.toml
+config.toml.*
 .env
 __pycache__/
 .pytest_cache/
