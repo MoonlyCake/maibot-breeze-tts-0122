@@ -1,5 +1,6 @@
 """Breeze TTS integration for MaiBot 0.12.2."""
 import base64
+import asyncio
 from copy import deepcopy
 import math
 import re
@@ -7,6 +8,7 @@ import time
 from pathlib import Path
 from typing import List, Tuple, Type
 
+from src.common.data_models.database_data_model import DatabaseMessages
 from src.common.logger import get_logger
 from src.chat.message_receive.chat_stream import get_chat_manager
 from src.chat.utils.utils import is_bot_self
@@ -17,12 +19,59 @@ from src.plugin_system.base.base_plugin import BasePlugin
 from src.plugin_system.base.component_types import ChatMode, ComponentInfo
 from src.plugin_system.base.config_types import ConfigField, ConfigLayout, ConfigTab
 from src.plugin_system import PythonDependency
+from src.plugin_system.apis import generator_api
 
 from .breeze_client import BreezeError, synthesize
-from .voice_guard import claim_request, reserve_usage, scope_allowed
+from .voice_guard import claim_request, is_admin, reserve_usage, scope_allowed
 
 logger = get_logger("breeze_tts_0122")
 _GUARD_DB = Path(__file__).resolve().parent / "voice_guard_data" / "usage.sqlite3"
+
+
+def _mentions_only_bot(segment, platform):
+    """Reject untrusted or other-user mentions that the 0.12.2 parser strips."""
+    if segment is None:
+        return False
+    kind = getattr(segment, "type", None)
+    data = getattr(segment, "data", None)
+    if kind == "seglist":
+        return isinstance(data, list) and all(_mentions_only_bot(part, platform) for part in data)
+    if kind == "mention_bot":
+        return True
+    if kind != "at":
+        return bool(isinstance(kind, str) and kind and not kind.startswith(("at", "mention")))
+    if isinstance(data, dict):
+        target_platform = str(data.get("platform") or "").strip()
+        if target_platform and target_platform.lower() != platform.lower():
+            return False
+        target = data.get("target_user_id") or data.get("user_id") or data.get("qq")
+    else:
+        target = data
+    if not isinstance(target, (str, int)) or isinstance(target, bool) or not str(target).strip():
+        return False
+    try:
+        return bool(is_bot_self(platform, str(target).strip()))
+    except Exception:
+        return False
+
+
+def _raw_command_text(segment):
+    """Reconstruct only literal text and mentions, never VLM/ASR output."""
+    if segment is None:
+        return None
+    kind = getattr(segment, "type", None)
+    data = getattr(segment, "data", None)
+    if kind == "text":
+        return data if isinstance(data, str) else None
+    if kind in ("at", "mention_bot"):
+        return ""
+    if kind != "seglist" or not isinstance(data, list):
+        return None
+    parts = [_raw_command_text(part) for part in data]
+    if any(part is None for part in parts):
+        return None
+    # MessageRecv joins nonempty child results with spaces.
+    return " ".join(part for part in parts if part)
 
 
 def _explicit_voice_request(text):
@@ -77,8 +126,11 @@ def _fresh_voice_message(message, stream_id, platform):
         latest_id = str(info.message_id or "").strip()
         latest_sender = str(info.user_info.user_id or "").strip()
         latest_platform = str(info.platform or "").strip()
+        segment = getattr(latest, "message_segment", None)
+        raw_text = _raw_command_text(segment)
         return bool(latest_id == str(message.message_id).strip() and latest_sender == sender
-                    and latest_platform == platform)
+                    and latest_platform == platform and raw_text is not None
+                    and _mentions_only_bot(segment, platform) and _explicit_voice_request(raw_text))
     except Exception:
         # Unknown live context is not a safe reason to spend or send voice.
         return False
@@ -130,6 +182,19 @@ class VoiceSender:
                                 self.get_config("guard.allow_private", False), platform=platform)
         return (platform, stream_id, allowed)
 
+    def _is_admin(self, platform):
+        """Only trust the sender supplied by the verified host message."""
+        incoming = getattr(self, "message", None)
+        if incoming is not None:
+            user = getattr(getattr(incoming, "message_info", None), "user_info", None)
+        else:
+            user = getattr(getattr(self, "action_message", None), "user_info", None)
+        user_platform = str(getattr(user, "platform", "") or "").strip()
+        if user_platform and user_platform.lower() != platform.lower():
+            return False
+        user_id = getattr(user, "user_id", None)
+        return is_admin(platform, user_id, self.get_config("guard.admin_users", []))
+
     def _settings(self):
         fields = {
             "backend": "self_hosted", "api_url": "", "api_key": "",
@@ -138,7 +203,7 @@ class VoiceSender:
         }
         return {key: self.get_config("breeze." + key, default) for key, default in fields.items()}
 
-    async def _speak(self, text, request_id=None):
+    async def _speak(self, text, request_id=None, *, pre_reserved=False):
         if not isinstance(text, str) or not text.strip():
             return False, "请输入需要朗读的文字"
         text = text.strip()
@@ -150,29 +215,16 @@ class VoiceSender:
         scope = self._scope()
         if scope is None or not scope[2]:
             return False, "当前聊天未启用语音"
-        try:
-            allowed, reason = await reserve_usage(
-                _GUARD_DB, f"{scope[0]}:{scope[1]}",
-                self.get_config("guard.cooldown_seconds", 60),
-                self.get_config("guard.daily_max_requests", 0),
-                request_id=request_id,
-            )
-        except Exception as exc:
-            logger.warning(f"Breeze TTS usage guard failed: {type(exc).__name__}")
-            return False, "语音用量检查失败，请检查日志"
-        if not allowed:
-            messages = {"cooldown": "语音请求过于频繁，请稍后再试", "daily_limit": "今日语音次数已达上限",
-                        "duplicate": "此条语音请求已处理", "invalid_config": "语音限制配置无效",
-                        "storage_error": "语音用量检查失败"}
-            return False, messages.get(reason, "语音用量检查失败")
+        if not pre_reserved:
+            allowed, reason = await self._reserve(scope, request_id)
+            if not allowed:
+                return False, self._limit_message(reason)
         try:
             audio = await synthesize(text, self._settings())
             if not isinstance(audio, bytes) or len(audio) < 44 or audio[:4] != b"RIFF" or audio[8:12] != b"WAVE":
                 raise ValueError("invalid WAV")
             if len(audio) > 10 * 1024 * 1024:
                 return False, "生成的音频过大，请缩短文字"
-            sent = await self.send_custom(message_type="voice", content=base64.b64encode(audio).decode("ascii"))
-            return (True, "语音已发送") if sent else (False, "语音发送失败，请检查适配器")
         except BreezeError as exc:
             logger.warning(f"Breeze TTS: {exc}")
             return False, "语音合成失败，请检查服务、配置和麦麦日志"
@@ -180,6 +232,31 @@ class VoiceSender:
             # Credentials, paths, and service response bodies must not enter logs.
             logger.warning(f"Breeze TTS failed: {type(exc).__name__}")
             return False, "语音合成失败，请检查服务、配置和麦麦日志"
+        try:
+            sent = await self.send_custom(message_type="voice", content=base64.b64encode(audio).decode("ascii"))
+        except Exception as exc:
+            # Delivery may have happened before an exception reached us.
+            logger.warning(f"Breeze TTS delivery outcome unknown: {type(exc).__name__}")
+            return None, "语音发送状态未知"
+        return (True, "语音已发送") if sent else (False, "语音发送失败，请检查适配器")
+
+    @staticmethod
+    def _limit_message(reason):
+        return {"cooldown": "语音请求过于频繁，请稍后再试", "daily_limit": "今日语音次数已达上限",
+                "duplicate": "此条语音请求已处理", "invalid_config": "语音限制配置无效",
+                "storage_error": "语音用量检查失败"}.get(reason, "语音用量检查失败")
+
+    async def _reserve(self, scope, request_id):
+        try:
+            return await reserve_usage(
+                _GUARD_DB, f"{scope[0]}:{scope[1]}",
+                self.get_config("guard.cooldown_seconds", 60),
+                self.get_config("guard.daily_max_requests", 0),
+                request_id=request_id, bypass_limits=self._is_admin(scope[0]),
+            )
+        except Exception as exc:
+            logger.warning(f"Breeze TTS usage guard failed: {type(exc).__name__}")
+            return False, "storage_error"
 
 
 class BreezeAction(VoiceSender, BaseAction):
@@ -213,51 +290,131 @@ class BreezeAction(VoiceSender, BaseAction):
                     return True, "此条消息已处理"
             except Exception as exc:
                 logger.warning(f"Breeze TTS message guard failed: {type(exc).__name__}")
-        # This Action is a standalone planner branch: send text before TTS so
-        # limits, failed synthesis, and failed voice delivery cannot erase it.
-        if not await self.send_text(text):
-            return False, "文字回复发送失败"
         if not claim_ok or scope is None or not scope[2] or not fresh_voice:
+            if not await self.send_text(text):
+                return False, "文字回复发送失败"
             await self.store_action_info(action_build_into_prompt=True,
                                          action_prompt_display="已发送文字回复",
                                          action_done=True)
             return True, "已发送文字回复"
-        ok, message = await self._speak(text)
+        ok, message = await self._speak(text, request_id="voice:" + message_id)
+        if ok is False and not await self.send_text(text):
+            return False, "语音及文字回复发送失败"
         await self.store_action_info(action_build_into_prompt=True,
-                                     action_prompt_display="已发送文字及语音回复" if ok else "已发送文字回复",
+                                     action_prompt_display="已发送语音回复" if ok else ("已发送文字回复" if ok is False else "语音发送状态未知"),
                                      action_done=True)
-        return True, "已发送文字及语音" if ok else "已发送文字回复；" + message
+        return True, "已发送语音" if ok else (("已发送文字回复；" if ok is False else "") + message)
 
 
 class BreezeCommand(VoiceSender, BaseCommand):
     command_name = "breeze_tts_command"
-    command_description = "使用 Breeze TTS 朗读文字"
-    command_pattern = r"^/breeze(?:\s+(?P<text>[\s\S]+?))?\s*$"
-    command_help = "/breeze <文字>：合成并发送语音"
-    command_examples = ["/breeze 你好，很高兴认识你"]
+    command_description = "让麦麦回答问题并尝试发送语音"
+    command_pattern = r"^\s*/breeze(?:\s+(?P<text>[\s\S]+?))?\s*$"
+    command_help = "/breeze <问题>：让麦麦回答并发送语音"
+    command_examples = ["/breeze 你在做什么？"]
+
+    async def _answer(self, question, scope, request_id):
+        """Generate against the actual sender and stream without requiring DB storage."""
+        incoming = self.message
+        info = incoming.message_info
+        user = getattr(info, "user_info", None)
+        sender = str(getattr(user, "user_id", "") or "").strip()
+        if not sender:
+            return None
+        group = getattr(info, "group_info", None)
+        target = DatabaseMessages(
+            message_id=request_id,
+            time=float(getattr(info, "time", time.time()) or time.time()),
+            chat_id=scope[1], processed_plain_text=question,
+            user_id=sender, user_nickname=str(getattr(user, "user_nickname", "") or ""),
+            user_platform=scope[0], chat_info_stream_id=scope[1], chat_info_platform=scope[0],
+            chat_info_group_id=str(getattr(group, "group_id", "") or "") or None,
+            chat_info_group_name=str(getattr(group, "group_name", "") or "") or None,
+        )
+        ok, result = await asyncio.wait_for(generator_api.generate_reply(
+            chat_stream=incoming.chat_stream, reply_message=target,
+            reply_reason="用户请求用语音回答问题", enable_tool=False,
+            enable_splitter=False, enable_chinese_typo=False,
+            request_type="breeze_tts", from_plugin=True,
+        ), timeout=120)
+        if not ok or result is None:
+            return None
+        parts = getattr(result, "processed_output", None)
+        if isinstance(parts, list):
+            answer = "\n".join(part.strip() for part in parts if isinstance(part, str) and part.strip())
+            if answer:
+                return answer
+        reply_set = getattr(result, "reply_set", None)
+        reply_data = getattr(reply_set, "reply_data", [])
+        texts = [part.content.strip() for part in reply_data
+                 if isinstance(getattr(part, "content", None), str) and part.content.strip()
+                 and str(getattr(getattr(part, "content_type", None), "value", getattr(part, "content_type", ""))) == "text"]
+        return "\n".join(texts) or None
 
     async def execute(self):
         text = (self.matched_groups.get("text") or "").strip()
+        incoming = getattr(self, "message", None)
+        scope = self._scope()
+        if scope is None:
+            if incoming is not None:
+                incoming.is_command = False
+            return False, "无法确认聊天范围", 0
+        if not _mentions_only_bot(getattr(incoming, "message_segment", None), scope[0]):
+            # Host parsing drops @other; let unrelated mentions proceed normally.
+            incoming.is_command = False
+            return True, "未提及本机器人", 0
+        raw_text = _raw_command_text(getattr(incoming, "message_segment", None))
+        raw_match = re.match(self.command_pattern, raw_text) if raw_text is not None else None
+        if not raw_match or (raw_match.group("text") or "").strip() != text:
+            incoming.is_command = False
+            return True, "不是纯文字语音命令", 0
+        if not scope[2]:
+            return False, "当前聊天未启用语音", 2
         if not text or text.lower() == "help":
             await self.send_text(self.command_help)
             return True, "已显示帮助", 2
-        inbound = getattr(getattr(self, "message", None), "message_info", None)
+        inbound = getattr(incoming, "message_info", None)
         request_id = str(getattr(inbound, "message_id", "") or "").strip()
         if not request_id:
             if self.get_config("general.send_errors", True):
                 await self.send_text("无法识别请求消息，语音未生成")
             return False, "无法识别请求消息", 2
-        ok, message = await self._speak(text, request_id=request_id)
-        if not ok and self.get_config("general.send_errors", True):
-            await self.send_text(message)
-        return ok, message, 2
+        limit = self.get_config("general.max_text_length", 500)
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 5000:
+            return False, "文字长度配置无效", 2
+        if len(text) > limit:
+            await self.send_text("问题超过单次文字长度限制，请缩短后重试。")
+            return False, "问题过长", 2
+        try:
+            claimed, reason = await claim_request(_GUARD_DB, f"{scope[0]}:{scope[1]}", request_id)
+            if not claimed:
+                if reason != "duplicate" and self.get_config("general.send_errors", True):
+                    await self.send_text("语音用量检查失败，请检查日志。")
+                return reason == "duplicate", "此条请求已处理" if reason == "duplicate" else "语音用量检查失败", 2
+            allowed, reason = await self._reserve(scope, "voice:" + request_id)
+            if not allowed:
+                message = self._limit_message(reason)
+                if self.get_config("general.send_errors", True):
+                    await self.send_text(message)
+                return False, message, 2
+            answer = await self._answer(text, scope, request_id)
+        except Exception as exc:
+            logger.warning(f"Breeze TTS reply generation failed: {type(exc).__name__}")
+            answer = None
+        if not answer:
+            await self.send_text("抱歉，暂时无法生成回复，请稍后再试。")
+            return False, "回复生成失败", 2
+        ok, message = await self._speak(answer, request_id="voice:" + request_id, pre_reserved=True)
+        if ok is False and not await self.send_text(answer):
+            return False, "语音及文字回复发送失败", 2
+        return True, "已发送语音" if ok else (("已发送文字回复；" if ok is False else "") + message), 2
 
 
 @register_plugin
 class BreezeTTSPlugin(BasePlugin):
     plugin_name = "breeze_tts_0122"
     plugin_description = "Breeze TTS 语音合成插件（MaiBot 0.12.2）"
-    plugin_version = "1.2.0"
+    plugin_version = "1.3.0"
     plugin_author = "MoonlyCake"
     enable_plugin = True
     config_file_name = "config.toml"
@@ -272,11 +429,11 @@ class BreezeTTSPlugin(BasePlugin):
     config_schema = {
         "plugin": {
             "enabled": ConfigField(type=bool, default=True, description="启用插件", label="启用 Breeze TTS", order=1),
-            "config_version": ConfigField(type=str, default="1.1.0", description="配置版本", hidden=True),
+            "config_version": ConfigField(type=str, default="1.2.0", description="配置版本", hidden=True),
         },
         "general": {
             "action_enabled": ConfigField(type=bool, default=True, description="启用语音 Action", label="允许语音 Action", hint="需同时启用范围与用量中的自然语言语音。此项变动后重载插件。", order=1),
-            "command_enabled": ConfigField(type=bool, default=True, description="启用 /breeze 命令", label="启用 /breeze 命令", hint="在聊天中输入 /breeze 加需要朗读的文字。", order=2),
+            "command_enabled": ConfigField(type=bool, default=True, description="启用 /breeze 命令", label="启用 /breeze 命令", hint="在聊天中输入 /breeze 加问题，麦麦会生成人设回答并尝试语音回复。", order=2),
             "max_text_length": ConfigField(type=int, default=500, description="单次合成最大字符数", label="单次文字上限", hint="允许 1–5000 字符；过长的文字不会发送给语音服务。", min=1, max=5000, step=1, input_type="number", order=3),
             "send_errors": ConfigField(type=bool, default=True, description="向聊天发送失败提示", label="在聊天中提示失败", hint="关闭后仍可在麦麦日志中查看错误类别。", order=4),
         },
@@ -298,8 +455,9 @@ class BreezeTTSPlugin(BasePlugin):
             "natural_enabled": ConfigField(type=bool, default=False, description="自然语言语音回复", label="自然语言语音回复", hint="默认关闭；仅当用户明确要求语音且聊天已授权时，允许模型选择语音 Action。修改后重载插件。", order=1),
             "allowed_groups": ConfigField(type=list, default=[], description="允许使用语音的群", label="允许的群", item_type="string", hint="空列表不允许任何群；可填 qq:群号，其他平台须填 平台:群号。命令和自然语言均受限。", order=2),
             "allow_private": ConfigField(type=bool, default=False, description="允许私聊语音", label="允许私聊", hint="默认关闭；开启后私聊也受用量与冷却限制。", order=3),
-            "cooldown_seconds": ConfigField(type=int, default=60, description="同一会话冷却时间（秒）", label="每会话冷却（秒）", input_type="number", min=0, max=86400, step=1, hint="默认 60 秒；0 表示关闭冷却。", order=4),
-            "daily_max_requests": ConfigField(type=int, default=0, description="每天最多合成次数", label="每日合成次数", input_type="number", min=0, max=10000, step=1, hint="所有聊天和两种触发方式共享；按运行机器本地日期，0 表示不限。发起前计数，失败不退。", order=5),
+            "admin_users": ConfigField(type=list, default=[], description="管理员账号列表", label="管理员账号", item_type="string", hint="仅豁免冷却和每日语音上限；仍受聊天范围、重复请求和平台余额限制。QQ 可填纯号码，其他平台填 平台:用户ID。", order=4),
+            "cooldown_seconds": ConfigField(type=int, default=60, description="同一会话冷却时间（秒）", label="每会话冷却（秒）", input_type="number", min=0, max=86400, step=1, hint="默认 60 秒；0 表示关闭冷却。", order=5),
+            "daily_max_requests": ConfigField(type=int, default=0, description="每天最多合成次数", label="每日合成次数", input_type="number", min=0, max=10000, step=1, hint="所有聊天和两种触发方式共享；按运行机器本地日期，0 表示不限。发起前计数，失败不退。", order=6),
         },
     }
 
